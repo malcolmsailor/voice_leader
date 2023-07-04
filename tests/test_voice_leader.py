@@ -2,11 +2,14 @@ import itertools
 import warnings
 
 from voice_leader import (
+    NoMoreVoiceLeadingsError,
     apply_vl,
     efficient_voice_leading,
-    NoMoreVoiceLeadingsError,
     voice_lead_pitches,
 )
+
+# def test_apply_vl():
+#     apply_vl()
 
 
 def test_remove_synonyms():
@@ -20,9 +23,7 @@ def test_remove_synonyms():
         ((2, 5), (0, 0, 0, 0)),
     ]
     for chord1, chord2 in tests:
-        motions, _ = efficient_voice_leading(
-            chord1, chord2, allow_different_cards=True
-        )
+        motions, _ = efficient_voice_leading(chord1, chord2, allow_different_cards=True)
         if len(motions) == 1:
             continue
         # TODO I think there may be cases where there will be more than one
@@ -53,7 +54,7 @@ def test_voice_lead_pitches():
     total_tests = 0
     total_failures = 0
     for ps, ref_pcs in tests:
-        for (preserve_root, avoid_bass_crossing) in itertools.product(
+        for preserve_root, avoid_bass_crossing in itertools.product(
             [True, False], repeat=2
         ):
             for min_pitch, max_pitch in (
@@ -196,9 +197,7 @@ def test_different_cardinality_handler():
         for c1, c2 in ((chord1, chord2), (chord2, chord1)):
             for i in range(12):
                 c3 = [(p + i) % 12 for p in c2]
-                vls, _ = efficient_voice_leading(
-                    c1, c3, allow_different_cards=True
-                )
+                vls, _ = efficient_voice_leading(c1, c3, allow_different_cards=True)
                 for vl in vls:
                     c4 = [p % 12 for p in apply_vl(vl, c1)]
                     assert set(p % 12 for p in c4) == set(c3)
