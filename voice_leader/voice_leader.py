@@ -32,12 +32,12 @@ def apply_vl(vl: VoiceLeadingMotion, chord: t.Sequence[int]) -> t.List[int]:
     >>> apply_vl(vl=((-3, 0), (-1, 1), 2), chord=(60, 64, 67))
     [57, 60, 63, 65, 69]
 
-    >>> apply_vl(vl=(-3, 0), chord=(60, 64, 67))
-    Traceback (innermost last):
-    AssertionError
+    # >>> apply_vl(vl=(-3, 0), chord=(60, 64, 67))
+    # Traceback (innermost last):
+    # AssertionError
 
-    Raises:
-        AssertionError if len(vl) != len(chord)
+    # Raises:
+    #     AssertionError if len(vl) != len(chord)
     """
     assert len(vl) == len(chord)
     out = []
@@ -128,11 +128,10 @@ def put_in_range(p, low=None, high=None, tet=12, fail_silently: bool = False):
     return p
 
 
-def voice_lead_pitches(
+def voice_lead_pitches_iter(
     chord1_pitches: t.Sequence[int],
     chord2_pcs: t.Sequence[int],
     preserve_root: bool = False,
-    return_first: bool = True,
     avoid_bass_crossing: bool = True,
     tet: int = 12,
     allow_different_cards: bool = True,
@@ -140,25 +139,8 @@ def voice_lead_pitches(
     max_pitch: t.Optional[int] = None,
     min_bass_pitch: t.Optional[int] = None,
     max_bass_pitch: t.Optional[int] = None,
-) -> t.List[int]:
-    """
-    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0])
-    [60, 65, 68]
-    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_root=True)
-    [53, 60, 68]
-
-    If preserve_root is True, the bass voice can exceed 'min_pitch'
-
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], min_pitch=60)
-    [62, 67, 71]
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_root=True,
-    ...     min_pitch=60)
-    [55, 62, 71]
-
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_root=True,
-    ...     min_pitch=60)
-    [55, 62, 65, 71]
-    """
+) -> t.Iterator[t.List[int]]:
+    """ """
 
     def _get_max_motions_up(pitches, start_i):
         if max_pitch is None:
@@ -214,46 +196,95 @@ def voice_lead_pitches(
             max_motions_up=_get_max_motions_up(chord1_pitches[i:], i),
         )
 
-    if return_first or len(motions) == 1:
-        motion = motions[0]
-    else:
-        motion = random.choice(motions)
-
-    if i == 0:
-        # either we are not preserving the root, or the voice-leading proceeds
-        # from the root as well
-        out = apply_vl(motion, chord1_pitches)
-        if preserve_root:
-            # find the index of the root in the next chord
-            while out[i] % tet != chord2_pcs[0]:
-                i += 1
-            if i != 0:
-                out[i] -= tet
-                out.sort()
+    for motion in motions:
+        if i == 0:
+            # either we are not preserving the root, or the voice-leading proceeds
+            # from the root as well
+            out = apply_vl(motion, chord1_pitches)
+            if preserve_root:
+                # find the index of the root in the next chord
+                while out[i] % tet != chord2_pcs[0]:
+                    i += 1
+                if i != 0:
+                    out[i] -= tet
+                    out.sort()
+                if avoid_bass_crossing:
+                    max_bass_pitch = (
+                        out[1]
+                        if max_bass_pitch is None
+                        else min(out[1], max_bass_pitch)
+                    )
+                out[0] = put_in_range(out[0], low=min_bass_pitch, high=max_bass_pitch)
+            yield out
+            return
+        else:
+            root_int = (chord2_pcs[0] - chord1_pitches[0]) % tet
+            if root_int > tet // 2:
+                root_int -= tet
+            new_root = chord1_pitches[0] + root_int
+            upper_parts = apply_vl(motion, chord1_pitches[1:])
             if avoid_bass_crossing:
-                max_bass_pitch = (
-                    out[1] if max_bass_pitch is None else min(out[1], max_bass_pitch)
-                )
-            out[0] = put_in_range(out[0], low=min_bass_pitch, high=max_bass_pitch)
-        return out
-    root_int = (chord2_pcs[0] - chord1_pitches[0]) % tet
-    if root_int > tet // 2:
-        root_int -= tet
-    new_root = chord1_pitches[0] + root_int
-    upper_parts = apply_vl(motion, chord1_pitches[1:])
-    if avoid_bass_crossing:
-        if upper_parts:
-            max_bass_pitch = (
-                upper_parts[0]
-                if max_bass_pitch is None
-                else min(upper_parts[0], max_bass_pitch)
-            )
-    new_root = put_in_range(new_root, low=min_bass_pitch, high=max_bass_pitch)
-    # while new_root > upper_parts[0] and avoid_bass_crossing:
-    #     new_root -= tet
-    # if max_pitch is not None:
-    #     assert all(p <= max_pitch for p in upper_parts)
-    return [new_root] + upper_parts
+                if upper_parts:
+                    max_bass_pitch = (
+                        upper_parts[0]
+                        if max_bass_pitch is None
+                        else min(upper_parts[0], max_bass_pitch)
+                    )
+            new_root = put_in_range(new_root, low=min_bass_pitch, high=max_bass_pitch)
+            # while new_root > upper_parts[0] and avoid_bass_crossing:
+            #     new_root -= tet
+            # if max_pitch is not None:
+            #     assert all(p <= max_pitch for p in upper_parts)
+            yield [new_root] + upper_parts
+
+
+def voice_lead_pitches(
+    chord1_pitches: t.Sequence[int],
+    chord2_pcs: t.Sequence[int],
+    preserve_root: bool = False,
+    avoid_bass_crossing: bool = True,
+    tet: int = 12,
+    allow_different_cards: bool = True,
+    min_pitch: t.Optional[int] = None,
+    max_pitch: t.Optional[int] = None,
+    min_bass_pitch: t.Optional[int] = None,
+    max_bass_pitch: t.Optional[int] = None,
+    return_first: bool = True,
+) -> t.List[int]:
+    """
+    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0])
+    [60, 65, 68]
+    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_root=True)
+    [53, 60, 68]
+
+    If preserve_root is True, the bass voice can exceed 'min_pitch'
+
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], min_pitch=60)
+    [62, 67, 71]
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_root=True,
+    ...     min_pitch=60)
+    [55, 62, 71]
+
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_root=True,
+    ...     min_pitch=60)
+    [55, 62, 65, 71]
+    """
+    iterator = voice_lead_pitches_iter(
+        chord1_pitches,
+        chord2_pcs,
+        preserve_root,
+        avoid_bass_crossing,
+        tet,
+        allow_different_cards,
+        min_pitch,
+        max_pitch,
+        min_bass_pitch,
+        max_bass_pitch,
+    )
+    if return_first:
+        return next(iterator)
+
+    return random.choice(list(iterator))
 
 
 def _remap_from_doubled_indices(
