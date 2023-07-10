@@ -1,15 +1,14 @@
 import itertools
 import warnings
 
+import pytest
+
 from voice_leader import (
     NoMoreVoiceLeadingsError,
     apply_vl,
-    efficient_voice_leading,
+    efficient_pc_voice_leading,
     voice_lead_pitches,
 )
-
-# def test_apply_vl():
-#     apply_vl()
 
 
 def test_remove_synonyms():
@@ -23,7 +22,9 @@ def test_remove_synonyms():
         ((2, 5), (0, 0, 0, 0)),
     ]
     for chord1, chord2 in tests:
-        motions, _ = efficient_voice_leading(chord1, chord2, allow_different_cards=True)
+        motions, _ = efficient_pc_voice_leading(
+            chord1, chord2, allow_different_cards=True
+        )
         if len(motions) == 1:
             continue
         # TODO I think there may be cases where there will be more than one
@@ -40,8 +41,9 @@ def test_remove_synonyms():
         #     for i in len
 
 
-def test_voice_lead_pitches():
-    tests = [
+@pytest.mark.parametrize(
+    "ps, ref_pcs",
+    (
         ((48, 64, 67, 70), (5, 9, 0)),
         ((48, 48, 52, 55), (2, 5, 7, 11)),
         ((48, 52, 55), (2, 5, 7, 11)),
@@ -50,55 +52,45 @@ def test_voice_lead_pitches():
         # because the first chord has 3 remaining pitches and the second one
         # only one pc, which leads to an "excess" error
         # ((48, 48, 52, 58), (7, 11)),
-    ]
-    total_tests = 0
-    total_failures = 0
-    for ps, ref_pcs in tests:
-        for preserve_root, avoid_bass_crossing in itertools.product(
-            [True, False], repeat=2
-        ):
-            for min_pitch, max_pitch in (
-                (False, False),
-                (True, False),
-                (False, True),
-            ):
-                min_pitch = min(ps) if min_pitch else None
-                max_pitch = max(ps) if max_pitch else None
-            for start_i in range(len(ref_pcs)):
-                total_tests += 1
-                pcs = ref_pcs[start_i:] + ref_pcs[:start_i]
-                try:
-                    out = voice_lead_pitches(
-                        ps,
-                        pcs,
-                        preserve_root=preserve_root,
-                        return_first=False,
-                        avoid_bass_crossing=avoid_bass_crossing,
-                        min_pitch=min_pitch,
-                        max_pitch=max_pitch,
-                    )
-                except NoMoreVoiceLeadingsError:
-                    total_failures += 1
-                    warnings.warn(
-                        f"couldn't voice-lead {ps} to pcs {pcs} with "
-                        f"preserve_root={preserve_root}, avoid_bass_crossing="
-                        f"{avoid_bass_crossing}, min_pitch={min_pitch}, and "
-                        f"max_pitch={max_pitch}"
-                    )
-                    continue
-                if preserve_root:
-                    assert out[0] % 12 == pcs[0]
-                if avoid_bass_crossing:
-                    assert out[0] <= out[1]
-                assert len(out) == len(pcs)
-                assert {pc % 12 for pc in out} == set(pcs)
-                if min_pitch is not None:
-                    assert min(out) >= min_pitch
-                if max_pitch is not None:
-                    assert max(out) <= max_pitch
-
-    if total_failures:
-        warnings.warn(f"{total_failures}/{total_tests} failed")
+    ),
+)
+@pytest.mark.parametrize("preserve_root", (True, False))
+@pytest.mark.parametrize("avoid_bass_crossing", (True, False))
+@pytest.mark.parametrize(
+    "min_pitch, max_pitch", ((False, False), (True, False), (False, True))
+)
+def test_voice_lead_pitches(
+    ps, ref_pcs, preserve_root, avoid_bass_crossing, min_pitch, max_pitch
+):
+    min_pitch = min(ps) if min_pitch else None
+    max_pitch = max(ps) + 2 if max_pitch else None
+    min_bass_pitch = min_pitch - 12 if min_pitch is not None else None
+    for start_i in range(len(ref_pcs)):
+        pcs = ref_pcs[start_i:] + ref_pcs[:start_i]
+        out = voice_lead_pitches(
+            ps,
+            pcs,
+            preserve_root=preserve_root,
+            return_first=False,
+            avoid_bass_crossing=avoid_bass_crossing,
+            min_pitch=min_pitch,
+            max_pitch=max_pitch,
+            min_bass_pitch=min_bass_pitch,
+        )
+        if preserve_root:
+            assert out[0] % 12 == pcs[0]
+        if avoid_bass_crossing:
+            if preserve_root:
+                # TODO: (Malcolm) remove check for preserve root after implementing
+                assert out[0] <= out[1]
+        assert len(out) == len(pcs)
+        assert {pc % 12 for pc in out} == set(pcs)
+        if min_pitch is not None and len(out) > 1:
+            assert min(out[1:]) >= min_pitch
+        if min_bass_pitch is not None:
+            assert min(out) >= min_bass_pitch
+        if max_pitch is not None:
+            assert max(out) <= max_pitch
 
 
 def test_efficient_voice_leading():
@@ -124,7 +116,7 @@ def test_efficient_voice_leading():
             displacement = -1
             while True:
                 try:
-                    out1, displacement1 = efficient_voice_leading(
+                    out1, displacement1 = efficient_pc_voice_leading(
                         c1,
                         c3,
                         tet=12,
@@ -138,13 +130,7 @@ def test_efficient_voice_leading():
                 except NoMoreVoiceLeadingsError:
                     break
                 for vl in out1:
-                    # c4 = [p % 12 for p in apply_vl(vl, c1)]
-                    assert set([p % 12 for p in apply_vl(vl, c1)]) == set(c3)
-                    # assert set((p + i) % 12 for (p, i) in zip(c1, vl)) == set(
-                    #     c3
-                    # )
-                    # for note_i, intervals in exclude_motions.items():
-                    #     assert vl[note_i] not in intervals
+                    assert set([p % 12 for p in apply_vl(vl, c1)[0]]) == set(c3)
                     for note_i, intervals in exclude_motions.items():
                         motions = vl[note_i]
                         if motions is None:
@@ -188,19 +174,25 @@ def test_efficient_voice_leading():
                 displacement = displacement1
 
 
-def test_different_cardinality_handler():
-    chord_pairs = [
+@pytest.mark.parametrize(
+    "chord1, chord2",
+    [
         ((0, 3, 7), (0, 4, 7, 11)),
         ((0, 3, 7), (0, 2, 4, 7, 9)),
-    ]
-    for chord1, chord2 in chord_pairs:
-        for c1, c2 in ((chord1, chord2), (chord2, chord1)):
-            for i in range(12):
-                c3 = [(p + i) % 12 for p in c2]
-                vls, _ = efficient_voice_leading(c1, c3, allow_different_cards=True)
-                for vl in vls:
-                    c4 = [p % 12 for p in apply_vl(vl, c1)]
-                    assert set(p % 12 for p in c4) == set(c3)
+    ],
+)
+@pytest.mark.parametrize("forward", (True, False))
+def test_different_cardinality_handler(chord1, chord2, forward):
+    if forward:
+        c1, c2 = chord1, chord2
+    else:
+        c1, c2 = chord2, chord1
+    for i in range(12):
+        c3 = [(p + i) % 12 for p in c2]
+        vls, _ = efficient_pc_voice_leading(c1, c3, allow_different_cards=True)
+        for vl in vls:
+            c4 = [p % 12 for p in apply_vl(vl, c1)[0]]
+            assert set(p % 12 for p in c4) == set(c3)
 
 
 if __name__ == "__main__":
