@@ -1,5 +1,7 @@
+from itertools import count, cycle
 import math
 from functools import reduce
+import random
 import typing as t
 
 
@@ -120,3 +122,87 @@ def next_pc_down_from_pitch(
     if (pc <= src_pc) if allow_unison else (pc < src_pc):
         return src_octave * tet + pc
     return (src_octave - 1) * tet + pc
+
+
+def closest_pc_iter(
+    pitch: int,
+    pc: int,
+    tet: int = 12,
+    prefer_down: bool | None = True,
+    max_results: int | None = None,
+) -> t.Iterable[int]:
+    """Yields the closest realization of `pc` to `pitch`, then the 2nd closest, etc.
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=2, max_results=5)]
+    [62, 50, 74, 38, 86]
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=11, max_results=5)]
+    [59, 71, 47, 83, 35]
+
+    ---------
+    Tritones:
+    ---------
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=6, max_results=5)]
+    [54, 66, 42, 78, 30]
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=6, max_results=5, prefer_down=False)]
+    [66, 54, 78, 42, 90]
+
+    If `prefer_down=None` then the direction is chosen randomly:
+    >>> [next(closest_pc_iter(pitch=60, pc=6, prefer_down=None)) for _ in range(10)]
+    ... # doctest: +SKIP
+    [54, 66, 66, 66, 66, 54, 54, 54, 54, 66]
+
+    --------
+    Unisons:
+    --------
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=0, max_results=5)]
+    [60, 48, 72, 36, 84]
+
+    >>> [i for i in closest_pc_iter(pitch=60, pc=0, max_results=5, prefer_down=False)]
+    [60, 72, 48, 84, 36]
+
+    If `prefer_down=None` then the direction is chosen randomly:
+    >>> [tuple(closest_pc_iter(pitch=60, pc=0, prefer_down=None, max_results=2))[1]
+    ...  for _ in range(10)]  # doctest: +SKIP
+    [48, 48, 48, 72, 48, 72, 48, 48, 48, 48]
+    """
+    pc_int = pc - (pitch % tet)
+
+    halftet = tet // 2
+
+    if pc_int > halftet:
+        pc_int -= tet
+    elif pc_int < -halftet:
+        pc_int += tet
+    elif abs(pc_int) == halftet:
+        if prefer_down is None:
+            pc_int *= random.choice([1, -1])
+        elif prefer_down:
+            pc_int = -halftet
+        else:
+            pc_int = halftet
+
+    if max_results is not None:
+        octaves = range(0, max_results * 12, 12)
+    else:
+        octaves = count(start=0, step=12)
+
+    if pc_int == 0:
+        if prefer_down is None:
+            octave_signs = random.choice([[1, -1], [-1, 1]])
+        elif prefer_down:
+            octave_signs = [1, -1]
+        else:
+            octave_signs = [-1, 1]
+    else:
+        octave_signs = [1, -1] if pc_int > 0 else [-1, 1]
+
+    octave_cycle = cycle(octave_signs)
+
+    out = pitch + pc_int
+    for octave, octave_sign in zip(octaves, octave_cycle):
+        out += octave * octave_sign
+        yield out

@@ -12,6 +12,7 @@ import numpy as np
 import logging
 
 from voice_leader.pitch_utils import (
+    closest_pc_iter,
     next_pc_down_from_pitch,
     next_pc_up_from_pitch,
     get_all_in_range,
@@ -39,6 +40,7 @@ Index = int
 
 PitchClass = int
 Pitch = int
+PitchOrPitchClass = int
 VoiceAssignments = t.Tuple[int, ...]
 
 
@@ -418,13 +420,681 @@ def ignore_voice_assignments_wrapper(
         yield out, voice_assignments
 
 
-def efficient_pitch_voice_leading_iter(
+def _remap_from_doubled_indices(
+    mapping: t.Mapping[int, t.Any], doubled_indices: t.Container[int]
+):
+    """
+    Used by growing_cardinality_handler()
+
+    >>> _remap_from_doubled_indices({0:"a", 1:"b", 2:"c"}, [1,])
+    {0: 'a', 1: 'b', 2: 'b', 3: 'c'}
+
+    >>> _remap_from_doubled_indices({0:"a", 2:"c"}, [1,])
+    {0: 'a', 3: 'c'}
+
+    >>> _remap_from_doubled_indices({0:"a", 1:"b", 2:"c"}, [3,])
+    {0: 'a', 1: 'b', 2: 'c'}
+
+    >>> _remap_from_doubled_indices({}, [1, 2])
+    {}
+
+    """
+    # This function feels inelegant...
+    if not mapping:
+        return {}
+    out = {}
+    j = 0
+    for i in range(max(mapping) + 1):
+        if i in mapping:
+            out[j] = mapping[i]
+        if i in doubled_indices:
+            j += 1
+            if i in mapping:
+                out[j] = mapping[i]
+        j += 1
+    return out
+
+
+def _growing_cardinality_handler(
+    vl_func: t.Callable[..., EquivalentVoiceLeadingMotions],
+    src_pcs: t.Sequence[PitchClass],
+    dst_pcs: t.Sequence[PitchClass],
+    *args,
+    sort: bool = True,
+    exclude_motions: t.Mapping[int, t.List[int]] = MappingProxyType({}),
+    max_motions_up: t.Mapping[int, int] = MappingProxyType({}),
+    max_motions_down: t.Mapping[int, int] = MappingProxyType({}),
+    **kwargs,
+) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
+    # This algorithm has horrible complexity but in practice I think that
+    # chords are small enough (we will almost always be going from 3 to 4
+    # notes) that it doesn't really matter. But nevertheless, if you are
+    # voice-leading between chords of like ~20 elements, don't use this!
+
+    card1, card2 = len(src_pcs), len(dst_pcs)
+    excess = card2 - card1
+    if excess > card1:
+        raise CardinalityDiffersTooMuch(
+            f"chord1 has {card1} two items; chord2 has {card2} items; "
+            "when increasing cardinality, the number of items can differ by "
+            "at most the number of items in chord1"
+        )
+    least_displacement = 2**31
+    best_vls, best_indices = [], []
+
+    previously_doubled_ps: t.Set[t.Tuple[int, ...]] = set()  # Only used if sort==True
+
+    for doubled_indices in combinations(range(card1), excess):
+        if sort:
+            doubled_ps = tuple(src_pcs[i] for i in doubled_indices)
+            if doubled_ps in previously_doubled_ps:
+                continue
+            previously_doubled_ps.add(doubled_ps)
+        temp_chord = []
+        for i, p in enumerate(src_pcs):
+            temp_chord.extend([p, p] if i in doubled_indices else [p])
+        vls, total_displacement = vl_func(
+            temp_chord,
+            dst_pcs,
+            *args,
+            exclude_motions=_remap_from_doubled_indices(
+                exclude_motions, doubled_indices
+            ),
+            max_motions_up=_remap_from_doubled_indices(max_motions_up, doubled_indices),
+            max_motions_down=_remap_from_doubled_indices(
+                max_motions_down, doubled_indices
+            ),
+            **kwargs,
+        )
+        if total_displacement < least_displacement:
+            best_indices = [doubled_indices]
+            best_vls = [vls]
+            least_displacement = total_displacement
+        elif total_displacement == least_displacement:
+            best_indices.append(doubled_indices)
+            best_vls.append(vls)
+
+    out = []
+    for indices, vls in zip(best_indices, best_vls):
+        for vl in vls:
+            vl_out = []
+            vl_i = 0
+            for i in range(card1):
+                if i in indices:
+                    vl_out.append((vl[vl_i], vl[vl_i + 1]))
+                    vl_i += 2
+                else:
+                    vl_out.append(vl[vl_i])
+                    vl_i += 1
+            out.append(tuple(vl_out))
+    return out, least_displacement
+
+
+def _remap_from_omitted_indices(
+    mapping: t.Mapping[int, t.Any], omitted_indices: t.Sequence[int]
+):
+    """Used by shrinking_cardinality_handler()
+
+    >>> _remap_from_omitted_indices({0:"a", 1:"b", 2:"c"}, [1,])
+    {0: 'a', 1: 'c'}
+
+    >>> _remap_from_omitted_indices({0:"a", 2:"c"}, [1,])
+    {0: 'a', 1: 'c'}
+
+    >>> _remap_from_omitted_indices({0:"a", 1:"b", 2:"c"}, [3,])
+    {0: 'a', 1: 'b', 2: 'c'}
+
+    >>> _remap_from_omitted_indices({}, [1, 2])
+    {}
+    """
+    # This function feels inelegant...
+    if not mapping:
+        return {}
+    out = {}
+    j = 0
+    for i in range(max(mapping) + 1):
+        if i in mapping:
+            out[j] = mapping[i]
+        if i in omitted_indices:
+            j -= 1
+        j += 1
+    return out
+
+
+def _shrinking_cardinality_handler(
+    vl_func: t.Callable[..., EquivalentVoiceLeadingMotions],
+    src_pcs: t.Sequence[PitchClass],
+    dst_pcs: t.Sequence[PitchClass],
+    *args,
+    sort: bool = True,
+    exclude_motions: t.Mapping[int, t.List[int]] = MappingProxyType({}),
+    max_motions_up: t.Mapping[int, int] = MappingProxyType({}),
+    max_motions_down: t.Mapping[int, int] = MappingProxyType({}),
+    **kwargs,
+) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
+    card1, card2 = len(src_pcs), len(dst_pcs)
+    excess = card1 - card2
+    if excess > card2:
+        raise CardinalityDiffersTooMuch(
+            f"chord1 has {card1} two items; chord2 has {card2} items; "
+            "when decreasing cardinality, the number of items can differ by "
+            "at most the number of items in chord2"
+        )
+    least_displacement = 2**31
+    best_vls, best_indices = [], []
+
+    previously_omitted_ps: t.Set[t.Tuple[int, ...]] = set()  # Only used if sort==True
+
+    for omitted_indices in combinations(range(card1), excess):
+        if sort:
+            omitted_ps = tuple(src_pcs[i] for i in omitted_indices)
+            if omitted_ps in previously_omitted_ps:
+                continue
+            previously_omitted_ps.add(omitted_ps)
+        temp_chord = [p for (i, p) in enumerate(src_pcs) if i not in omitted_indices]
+        vls, total_displacement = vl_func(
+            temp_chord,
+            dst_pcs,
+            *args,
+            sort=sort,
+            exclude_motions=_remap_from_omitted_indices(
+                exclude_motions, omitted_indices
+            ),
+            max_motions_up=_remap_from_omitted_indices(max_motions_up, omitted_indices),
+            max_motions_down=_remap_from_omitted_indices(
+                max_motions_down, omitted_indices
+            ),
+            **kwargs,
+        )
+        if total_displacement < least_displacement:
+            best_indices = [omitted_indices]
+            best_vls = [vls]
+            least_displacement = total_displacement
+        elif total_displacement == least_displacement:
+            best_indices.append(omitted_indices)
+            best_vls.append(vls)
+    out = []
+    for indices, vls in zip(best_indices, best_vls):
+        for vl in vls:
+            vl_out = []
+            vl_i = 0
+            for i in range(card1):
+                if i in indices:
+                    vl_out.append(None)
+                else:
+                    vl_out.append(vl[vl_i])
+                    vl_i += 1
+            out.append(tuple(vl_out))
+    return out, least_displacement
+
+
+def different_cardinality_handler(
+    vl_func: t.Callable[..., EquivalentVoiceLeadingMotions],
+    src_pcs: t.Sequence[PitchClass],
+    dst_pcs: t.Sequence[PitchClass],
+    *args,
+    **kwargs,
+) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
+    if len(src_pcs) > len(dst_pcs):
+        return _shrinking_cardinality_handler(
+            vl_func, src_pcs, dst_pcs, *args, **kwargs
+        )
+    return _growing_cardinality_handler(vl_func, src_pcs, dst_pcs, *args, **kwargs)
+
+
+def efficient_pc_voice_leading(
+    src_pcs: t.Sequence[PitchClass],
+    dst_pcs: t.Sequence[PitchClass],
+    *,
+    tet: int = 12,
+    displacement_more_than: t.Optional[int] = None,
+    exclude_motions: t.Mapping[int, t.List[int]] = MappingProxyType({}),
+    max_motions_up: t.Mapping[int, int] = MappingProxyType({}),
+    max_motions_down: t.Mapping[int, int] = MappingProxyType({}),
+    allow_different_cards: bool = False,
+    sort: bool = True,
+) -> EquivalentVoiceLeadingMotions:
+    """Returns efficient voice-leading(s) between two chords.
+
+    >>> src_pcs = [7, 0, 2]
+    >>> dst_pcs = [4, 8, 11]
+    >>> vl_motions, total_displacement = efficient_pc_voice_leading(src_pcs, dst_pcs)
+    >>> vl_motions
+    [(1, -1, 2)]
+    >>> total_displacement
+    4
+
+    >>> src_pcs = (7, 2, 7)
+    >>> dst_pcs = (0, 4, 7)
+    >>> efficient_pc_voice_leading(src_pcs, dst_pcs)
+    ([(-3, -2, 0)], 5)
+    >>> efficient_pc_voice_leading(src_pcs, dst_pcs, sort=False)
+    ([(-3, -2, 0), (0, -2, -3)], 5)
+
+    Keyword args:
+        displacement_more_than: optional int; voice-leading will be enforced to
+            have a greater total displacement than this interval.
+        exclude_motions: optional dict of form int: list[int]. The note in
+            chord1 whose index matches the key will be prevented from proceeding
+            by any interval in the list.
+        max_motions_up: optional dict. The note in chord1 whose index matches key
+            can ascend by at most the indicated interval in the list.
+        max_motions_down: optional dict. The note in chord1 whose index matches key
+            can descend by at most the indicated interval in the list. (These
+            intervals should be negative.)
+        allow_different_cards: if True, then will provide voice-leadings for
+            chords of different cardinalities. (Otherwise, raises a ValueError.)
+            If this occurs, the returned
+        sort: if True, then if chord1 contains any unisons, the voice-
+            leadings applied to those unisons will be sorted in ascending
+            order. Note that this means that `exclude_motions` and similar may
+            fail (at least until the implementation gets more robust) if one
+            of the pitches of the unison has an excluded motion but the others
+            do not.
+
+    Returns:
+        Two-tuple consisting of
+            - a list of voice-leadings. (A list because there may be more than
+                one equally-efficient voice-leading.)
+
+                Each voice leading is a tuple. The elements of the tuple can
+                be ints, tuples of ints (in the case of a voice-leading to a
+                chord of larger cardinality) or None (in the case of a voice-
+                leading to a chord of smaller cardinality).
+            - integer indicating the total displacement.
+
+    Raises:
+        NoMoreVoiceLeadingsError if there is no voice leading that satisfies
+            displacement_more_than and exclude_motions
+
+
+    """
+
+    if displacement_more_than is None:
+        displacement_more_than = -1
+
+    def _voice_leading_sub(in_indices, out_indices, current_displacement):
+        """This is a recursive function for calculating most efficient
+        voice leadings.
+
+        The idea is that a bijective voice-leading between two
+        ordered chords can be represented by a single set of indexes,
+        where the first index *x* maps the first note of the first chord
+        on to the *x*th note of the second chord, and so on.
+
+        Should be initially called as follows:
+            _voice_leading_sub(list(range(cardinality of chords)),
+                               [],
+                               0)
+
+        The following variables are found in the enclosing scope:
+            chord1
+            chord2
+            best_sum
+            best_vl_indices
+            halftet
+            tet
+            displacement_more_than
+
+        """
+        # LONGTERM try multisets somehow?
+        nonlocal best_displacement, best_vl_indices
+        if not in_indices:
+            if current_displacement > displacement_more_than:
+                if best_displacement > current_displacement:
+                    best_displacement = current_displacement
+                    best_vl_indices = [out_indices]
+                elif best_displacement == current_displacement:
+                    best_vl_indices.append(out_indices)
+        else:
+            src_pcs_i = len(out_indices)
+            src_pc = src_pcs[src_pcs_i]
+            unique = not any((src_pc == pc) for pc in src_pcs[:src_pcs_i])
+            for i, dst_pcs_i in enumerate(in_indices):
+                motion = dst_pcs[dst_pcs_i] - src_pcs[src_pcs_i]
+                if motion > halftet:
+                    motion -= tet
+                elif motion < -halftet:
+                    motion += tet
+                if src_pcs_i in max_motions_up:
+                    if motion > max_motions_up[src_pcs_i]:
+                        continue
+                if src_pcs_i in max_motions_down:
+                    if motion < max_motions_down[src_pcs_i]:
+                        continue
+                if src_pcs_i in exclude_motions:
+                    if motion in exclude_motions[src_pcs_i]:
+                        #      MAYBE expand to include combinations of
+                        #       multiple voice leading motions
+                        continue
+                this_displacement = current_displacement + abs(motion)
+                if this_displacement > best_displacement:
+                    continue
+                _voice_leading_sub(
+                    in_indices[:i] + in_indices[i + 1 :],
+                    out_indices + [dst_pcs_i],
+                    this_displacement,
+                )
+                if not unique:
+                    # if the pitch-class is not unique, all other mappings of
+                    # it will already have been checked in the recursive calls,
+                    # and so we can break here
+                    # TODO: (Malcolm) I'm not sure that this is correct; what about
+                    # cases of tripled tones etc.?
+                    break
+
+    card = len(src_pcs)
+    if card != len(dst_pcs):
+        if allow_different_cards:
+            return different_cardinality_handler(
+                efficient_pc_voice_leading,
+                src_pcs,
+                dst_pcs,
+                tet=tet,
+                displacement_more_than=displacement_more_than,
+                exclude_motions=exclude_motions,
+                max_motions_up=max_motions_up,
+                max_motions_down=max_motions_down,
+                sort=sort,
+            )
+        raise ValueError(f"{src_pcs} and {dst_pcs} have different lengths.")
+
+    best_displacement = starting_displacement = 2**31
+    best_vl_indices = []
+    halftet = tet // 2
+
+    _voice_leading_sub(list(range(card)), [], 0)
+
+    # If best_sum hasn't changed, then we haven't found any
+    # voice-leadings.
+    if best_displacement == starting_displacement:
+        raise NoMoreVoiceLeadingsError
+
+    # When there are unisons in chord2, there can be duplicate voice-leadings.
+    # There is probably a more efficient way of avoiding generating these in
+    # the first place, but for now, we get rid of them by casting to a set.
+    voice_leading_intervals = list(
+        {indices_to_vl(indices, src_pcs, dst_pcs, tet) for indices in best_vl_indices}
+    )
+
+    if len(voice_leading_intervals) > 1:
+        voice_leading_intervals.sort(key=np.var)
+
+    if sort:
+        voice_leading_intervals = sort_voice_leading_motions_and_remove_duplicates(
+            src_pcs, voice_leading_intervals
+        )
+        # unisons = tuple(p for p in set(src_pcs) if src_pcs.count(p) > 1)
+        # unison_indices = tuple(
+        #     tuple(i for i, p1 in enumerate(src_pcs) if p1 == p2) for p2 in unisons
+        # )
+        # for j, vl in enumerate(voice_leading_intervals):
+        #     vl_copy = list(vl)
+        #     for indices in unison_indices:
+        #         motions = [vl[i] for i in indices]
+        #         motions.sort()
+        #         for i, m in zip(indices, motions):
+        #             vl_copy[i] = m
+        #     voice_leading_intervals[j] = tuple(vl_copy)
+
+        # voice_leading_intervals = list(set(voice_leading_intervals))
+
+    return voice_leading_intervals, best_displacement  # type:ignore
+
+
+def efficient_pc_voice_leading_iter(
+    *args, **kwargs
+) -> t.Iterator[EquivalentVoiceLeadingMotions]:
+    """
+    >>> src_pcs = (7, 2, 7)
+    >>> dst_pcs = (0, 4, 7)
+    >>> vl_iter = efficient_pc_voice_leading_iter(src_pcs, dst_pcs)
+    >>> next(vl_iter)[0], next(vl_iter)[0]
+    ([(-3, -2, 0)], [(0, 2, 5)])
+    """
+    displacement_more_than = kwargs.pop("displacement_more_than", -1)
+    while True:
+        try:
+            vl_motions, total_displacement = efficient_pc_voice_leading(
+                *args, displacement_more_than=displacement_more_than, **kwargs
+            )
+            yield vl_motions, total_displacement
+            displacement_more_than = total_displacement
+        except NoMoreVoiceLeadingsError:
+            return
+
+
+def sort_voice_leading_motions_and_remove_duplicates(
+    src_pcs_or_pitches: t.Sequence[PitchOrPitchClass],
+    voice_leading_motions: t.Sequence[BijectiveVoiceLeadingMotion],
+) -> t.List[VoiceLeadingMotion]:
+    """
+    >>> sort_voice_leading_motions_and_remove_duplicates([0, 0], [(2, -2)])
+    [(-2, 2)]
+    >>> sort_voice_leading_motions_and_remove_duplicates([0, 0], [(2, -2), (2, -2), (-2, 2)])
+    [(-2, 2)]
+    >>> sort_voice_leading_motions_and_remove_duplicates([0, 4, 7, 0], [(2, -2, 0, -1)])
+    [(-1, -2, 0, 2)]
+
+    >>> sort_voice_leading_motions_and_remove_duplicates([0, 4, 7], [(2, 3, 1), (1, 3, 2)])
+    [(2, 3, 1), (1, 3, 2)]
+
+    This function only works with *bijective* voice-leadings.
+    >>> sort_voice_leading_motions_and_remove_duplicates([0, 0, 0], [((-2, 2), 5, None)])
+    Traceback (most recent call last):
+    ValueError: Voice-leading must be bijective
+    """
+    p_indices: t.DefaultDict[PitchOrPitchClass, t.List[int]] = defaultdict(list)
+
+    if not all(
+        isinstance(atom, int) for motion in voice_leading_motions for atom in motion
+    ):
+        raise ValueError("Voice-leading must be bijective")
+
+    for i, p in enumerate(src_pcs_or_pitches):
+        p_indices[p].append(i)
+
+    unison_indices = [indices for indices in p_indices.values() if len(indices) > 1]
+
+    if not unison_indices:
+        return list(voice_leading_motions)
+
+    unique_accumulator = set()
+    for motion in voice_leading_motions:
+        motion_copy = list(motion)
+        for indices in unison_indices:
+            unison_atoms = sorted(motion[i] for i in indices)
+            for idx, unison_atom in zip(indices, unison_atoms):
+                motion_copy[idx] = unison_atom
+        unique_accumulator.add(tuple(motion_copy))
+
+    return list(unique_accumulator)
+
+
+def efficient_pitch_voice_leading(
     src_pitches: t.Sequence[Pitch],
     dst_pcs: t.Sequence[PitchClass],
+    *,
+    tet: int = 12,
+    displacement_more_than: int | None = None,
+    exclude_motions: t.Mapping[int, t.List[int]] = MappingProxyType({}),
+    max_motions_up: t.Mapping[int, int] = MappingProxyType({}),
+    max_motions_down: t.Mapping[int, int] = MappingProxyType({}),
+    allow_different_cards: bool = False,
+    sort: bool = True,
+) -> EquivalentVoiceLeadingMotions:
+    """
+    >>> src_pcs = [55, 62, 72]
+    >>> dst_pcs = [4, 8, 11]
+    >>> vl_motions, total_displacement = efficient_pitch_voice_leading(src_pcs, dst_pcs)
+    >>> vl_motions
+    [(1, 2, -1)]
+    >>> total_displacement
+    4
+    """
+
+    if displacement_more_than is None:
+        displacement_more_than = -1
+
+    def _voice_leading_sub(in_indices, out_motions, current_displacement):
+        nonlocal best_displacement, best_motions
+
+        if not in_indices:
+            # base condition
+            if current_displacement > displacement_more_than:
+                if best_displacement > current_displacement:
+                    best_displacement = current_displacement
+                    best_motions = [tuple(out_motions)]
+                elif best_displacement == current_displacement:
+                    best_motions.append(tuple(out_motions))
+            return
+
+        src_pitch_i = len(out_motions)
+        src_pitch = src_pitches[src_pitch_i]
+
+        for i, dst_pcs_i in enumerate(in_indices):
+            dst_pc = dst_pcs[dst_pcs_i]
+            for dst_pitch in closest_pc_iter(
+                pitch=src_pitch, pc=dst_pc, prefer_down=None, max_results=3, tet=tet
+            ):
+                motion = dst_pitch - src_pitch
+                if (
+                    (
+                        src_pitch_i in max_motions_up
+                        and motion > max_motions_up[src_pitch_i]
+                    )
+                    or (
+                        src_pitch_i in max_motions_down
+                        and motion < max_motions_down[src_pitch_i]
+                    )
+                    or (
+                        src_pitch_i in exclude_motions
+                        and motion in exclude_motions[src_pitch_i]
+                    )
+                ):
+                    continue
+                this_displacement = current_displacement + abs(motion)
+                if this_displacement > best_displacement:
+                    continue
+                _voice_leading_sub(
+                    in_indices[:i] + in_indices[i + 1 :],
+                    out_motions + [motion],
+                    this_displacement,
+                )
+
+    best_displacement = starting_displacement = 2**31
+    best_motions = []
+
+    src_card = len(src_pitches)
+    if src_card != len(dst_pcs):
+        if allow_different_cards:
+            return different_cardinality_handler(
+                efficient_pitch_voice_leading,
+                src_pitches,
+                dst_pcs,
+                tet=tet,
+                displacement_more_than=displacement_more_than,
+                exclude_motions=exclude_motions,
+                max_motions_up=max_motions_up,
+                max_motions_down=max_motions_down,
+                sort=sort,
+            )
+        raise ValueError(f"{src_pitches} and {dst_pcs} have different lengths.")
+
+    _voice_leading_sub(list(range(src_card)), [], 0)
+
+    # If best_displacement hasn't changed, then we haven't found any
+    # voice-leadings.
+    if best_displacement == starting_displacement:
+        raise NoMoreVoiceLeadingsError
+
+    # Get rid of duplicates
+    best_motions = list(set(best_motions))
+
+    # TODO: (Malcolm) Am I sure I want to sort like this?
+    if len(best_motions) > 1:
+        best_motions.sort(key=np.var)
+
+    if sort:
+        best_motions = sort_voice_leading_motions_and_remove_duplicates(
+            src_pitches, best_motions
+        )
+    return best_motions, best_displacement
+
+
+def voice_lead_pitches(
+    chord1_pitches: t.Sequence[Pitch],
+    chord2_pcs: t.Sequence[PitchClass],
+    preserve_bass: bool = False,
+    avoid_bass_crossing: bool = True,
     tet: int = 12,
     allow_different_cards: bool = True,
     min_pitch: t.Optional[int] = None,
     max_pitch: t.Optional[int] = None,
+    min_bass_pitch: t.Optional[int] = None,
+    max_bass_pitch: t.Optional[int] = None,
+    return_first: bool = True,
+) -> t.Sequence[Pitch]:
+    """
+    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0])
+    (60, 65, 68)
+    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_bass=True)
+    (53, 60, 68)
+
+    >>> voice_lead_pitches([60, 64, 67], [0, 4, 9], preserve_bass=True)
+    (60, 64, 69)
+
+    If preserve_bass is True, the bass voice can exceed 'min_pitch'
+
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], min_pitch=60)
+    (62, 67, 71)
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
+    ...     min_pitch=60)
+    (55, 62, 71)
+
+    TODO what happens with min_bass_pitch?
+    # >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
+    # ...     min_bass_pitch=60)
+    # (55, 62, 71)
+
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_bass=True,
+    ...     min_pitch=60)
+    (55, 62, 65, 71)
+
+    Note that when shrinking cardinality, pitches will not be doubled.
+    >>> voice_lead_pitches([64, 65, 67, 71], [0, 4, 7], preserve_bass=True)
+    (60, 64, 67)
+
+    However, it is possible to double pitch-classes in `chord2_pcs`.
+    >>> voice_lead_pitches([64, 65, 67, 71], [0, 0, 4, 7], preserve_bass=True)
+    (60, 64, 67, 72)
+    """
+    iterator = voice_lead_pitches_iter(
+        chord1_pitches,
+        chord2_pcs,
+        preserve_bass=preserve_bass,
+        avoid_bass_crossing=avoid_bass_crossing,
+        tet=tet,
+        allow_different_cards=allow_different_cards,
+        min_pitch=min_pitch,
+        max_pitch=max_pitch,
+        min_bass_pitch=min_bass_pitch,
+        max_bass_pitch=max_bass_pitch,
+    )
+    if return_first:
+        return next(iterator)[0]
+
+    # TODO: (Malcolm) I think we need to constrain the maximum number of options here
+
+    return random.choice(list(iterator))[0]
+
+
+def efficient_pitch_voice_leading_iter(
+    src_pitches: t.Sequence[Pitch],
+    *args,
+    min_pitch: t.Optional[int] = None,
+    max_pitch: t.Optional[int] = None,
+    **kwargs,
 ) -> t.Iterator[EquivalentVoiceLeadingMotions]:
     """
     >>> src_pitches = (55, 62, 67)
@@ -436,23 +1106,30 @@ def efficient_pitch_voice_leading_iter(
 
     def _get_max_motions_up(pitches):
         if max_pitch is None:
-            return None
+            return {}
         return {i: max_pitch - pitch for i, pitch in enumerate(pitches)}
 
     def _get_max_motions_down(pitches):
         if min_pitch is None:
-            return None
+            return {}
         return {i: min_pitch - pitch for i, pitch in enumerate(pitches)}
 
-    return efficient_pc_voice_leading_iter(
-        [p % tet for p in src_pitches],
-        dst_pcs,
-        tet=tet,
-        allow_different_cards=allow_different_cards,
-        max_motions_down=_get_max_motions_down(src_pitches),
-        max_motions_up=_get_max_motions_up(src_pitches),
-        sort=False,
-    )
+    displacement_more_than = kwargs.pop("displacement_more_than", -1)
+
+    while True:
+        try:
+            vl_motions, total_displacement = efficient_pitch_voice_leading(
+                src_pitches,
+                *args,
+                displacement_more_than=displacement_more_than,
+                max_motions_up=_get_max_motions_up(src_pitches),
+                max_motions_down=_get_max_motions_down(src_pitches),
+                **kwargs,
+            )
+            yield vl_motions, total_displacement
+            displacement_more_than = total_displacement
+        except NoMoreVoiceLeadingsError:
+            return
 
 
 def preserve_and_split_root_vl_iters(
@@ -463,14 +1140,16 @@ def preserve_and_split_root_vl_iters(
     max_pitch: t.Optional[int] = None,
     min_bass_pitch: t.Optional[int] = None,
     max_bass_pitch: t.Optional[int] = None,
+    allow_different_cards: bool = True,
     **vl_kwargs,
 ) -> t.List[t.Iterator[EquivalentVoiceLeadingMotions]]:
     """
     >>> src_pitches = [60, 64, 67]
     >>> dst_pcs = [2, 5, 7, 11]
     >>> vl_iters = preserve_and_split_root_vl_iters(src_pitches, dst_pcs)
-    >>> [next(vl_iter) for vl_iter in vl_iters]
-    [([((2, 5), 3, 4)], 14), ([((-10, -1), 1, 0)], 12)]
+    >>> [next(vl_iter) for vl_iter in vl_iters]  # doctest: +NORMALIZE_WHITESPACE
+    [([((2, 5), 3, 4), ((2, 7), 1, 4), ((2, 5), 7, 0), ((2, 11), 1, 0)], 14),
+     ([((-10, -1), 1, 0)], 12)]
     """
     # Since `preserve_bass` is True, if we are splitting the bass, one of
     # the bass voice-leading motions must be the two roots, and the root of
@@ -496,6 +1175,7 @@ def preserve_and_split_root_vl_iters(
             dst_pcs[1:],
             min_pitch=this_min_pitch,
             max_pitch=max_pitch,
+            allow_different_cards=allow_different_cards,
             **vl_kwargs,
         )
         vl_iter = vl_iter_wrapper(sub_iter, prependings={0: root_motion})
@@ -511,6 +1191,7 @@ def preserve_bass_vl_iters(
     max_pitch: t.Optional[int] = None,
     min_bass_pitch: t.Optional[int] = None,
     max_bass_pitch: t.Optional[int] = None,
+    allow_different_cards: bool = True,
     **vl_kwargs,
 ) -> t.List[t.Iterator[EquivalentVoiceLeadingMotions]]:
     """Note: this will not produce voice-leadings where the bass-note of the second
@@ -520,7 +1201,7 @@ def preserve_bass_vl_iters(
     >>> dst_pcs = [5, 8, 0]
     >>> vl_iters = preserve_bass_vl_iters(src_pitches, dst_pcs)
     >>> [next(vl_iter) for vl_iter in vl_iters]
-    [([(5, 4, 5)], 14), ([(-7, -4, 1)], 12)]
+    [([(5, 4, 5), (5, 8, 1)], 14), ([(-7, -4, 1)], 12)]
 
     >>> src_pitches = [60, 64, 67]
     >>> dst_pcs = [2, 5, 7, 11]
@@ -550,6 +1231,7 @@ def preserve_bass_vl_iters(
             dst_pcs[1:],
             min_pitch=this_min_pitch,
             max_pitch=max_pitch,
+            allow_different_cards=allow_different_cards,
             **vl_kwargs,
         )
         vl_iter = vl_iter_wrapper(sub_iter, insertions={0: root_motion})
@@ -561,6 +1243,7 @@ def dont_preserve_bass_vl_iters(
     src_pitches: t.Sequence[Pitch],
     dst_pcs: t.Sequence[PitchClass],
     avoid_bass_crossing: bool = True,
+    allow_different_cards: bool = True,
     **vl_kwargs,
 ) -> t.List[t.Iterator[EquivalentVoiceLeadingMotions]]:
     """Note: this will not produce voice-leadings where the bass-note of the second
@@ -584,7 +1267,14 @@ def dont_preserve_bass_vl_iters(
             "`avoid_bass_crossing=True`. This parameter is not implemented yet and "
             "will have no effect."
         )
-    return [efficient_pitch_voice_leading_iter(src_pitches, dst_pcs, **vl_kwargs)]
+    return [
+        efficient_pitch_voice_leading_iter(
+            src_pitches,
+            dst_pcs,
+            allow_different_cards=allow_different_cards,
+            **vl_kwargs,
+        )
+    ]
 
 
 def get_voice_lead_pitches_iters(
@@ -683,7 +1373,6 @@ def voice_lead_pitches_multiple_options_iter(
     yield from apply_iter
 
 
-# TODO: (Malcolm) rename preserve_bass to the more accurate preserve_bass
 def voice_lead_pitches_iter(
     chord1_pitches: t.Sequence[Pitch],
     chord2_pcs: t.Sequence[PitchClass],
@@ -695,7 +1384,7 @@ def voice_lead_pitches_iter(
     >>> chord2_pcs = [2, 5, 7, 11]
     >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs)
     >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
-    ((59, 62, 65, 67), (62, 65, 67, 71), (55, 62, 65, 71))
+    ((59, 62, 65, 67), (62, 65, 67, 71), (59, 65, 67, 74))
 
     If `ignore_voice_assignments` is True, then voice-leadings that result in exactly
     the same pitches (differing only in which voice is led where) are considered
@@ -722,524 +1411,3 @@ def voice_lead_pitches_iter(
         apply_iter = ignore_voice_assignments_wrapper(apply_iter)
 
     yield from apply_iter
-
-
-def voice_lead_pitches(
-    chord1_pitches: t.Sequence[Pitch],
-    chord2_pcs: t.Sequence[PitchClass],
-    preserve_bass: bool = False,
-    avoid_bass_crossing: bool = True,
-    tet: int = 12,
-    allow_different_cards: bool = True,
-    min_pitch: t.Optional[int] = None,
-    max_pitch: t.Optional[int] = None,
-    min_bass_pitch: t.Optional[int] = None,
-    max_bass_pitch: t.Optional[int] = None,
-    return_first: bool = True,
-) -> t.Sequence[Pitch]:
-    """
-    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0])
-    (60, 65, 68)
-    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_bass=True)
-    (53, 60, 68)
-
-    >>> voice_lead_pitches([60, 64, 67], [0, 4, 9], preserve_bass=True)
-    (60, 64, 69)
-
-    If preserve_bass is True, the bass voice can exceed 'min_pitch'
-
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], min_pitch=60)
-    (62, 67, 71)
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
-    ...     min_pitch=60)
-    (55, 62, 71)
-
-    TODO what happens with min_bass_pitch?
-    # >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
-    # ...     min_bass_pitch=60)
-    # (55, 62, 71)
-
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_bass=True,
-    ...     min_pitch=60)
-    (55, 62, 65, 71)
-
-    Note that when shrinking cardinality, pitches will not be doubled.
-    >>> voice_lead_pitches([64, 65, 67, 71], [0, 4, 7], preserve_bass=True)
-    (60, 64, 67)
-
-    However, it is possible to double pitch-classes in `chord2_pcs`.
-    >>> voice_lead_pitches([64, 65, 67, 71], [0, 0, 4, 7], preserve_bass=True)
-    (60, 64, 67, 72)
-    """
-    iterator = voice_lead_pitches_iter(
-        chord1_pitches,
-        chord2_pcs,
-        preserve_bass=preserve_bass,
-        avoid_bass_crossing=avoid_bass_crossing,
-        tet=tet,
-        allow_different_cards=allow_different_cards,
-        min_pitch=min_pitch,
-        max_pitch=max_pitch,
-        min_bass_pitch=min_bass_pitch,
-        max_bass_pitch=max_bass_pitch,
-    )
-    if return_first:
-        return next(iterator)[0]
-
-    # TODO: (Malcolm) I think we need to constrain the maximum number of options here
-    return random.choice(list(iterator))[0]
-
-
-def _remap_from_doubled_indices(
-    mapping: t.Dict[int, t.Any], doubled_indices: t.Container[int]
-):
-    """
-    Used by growing_cardinality_handler()
-
-    >>> _remap_from_doubled_indices({0:"a", 1:"b", 2:"c"}, [1,])
-    {0: 'a', 1: 'b', 2: 'b', 3: 'c'}
-
-    >>> _remap_from_doubled_indices({0:"a", 2:"c"}, [1,])
-    {0: 'a', 3: 'c'}
-
-    >>> _remap_from_doubled_indices({0:"a", 1:"b", 2:"c"}, [3,])
-    {0: 'a', 1: 'b', 2: 'c'}
-
-    >>> _remap_from_doubled_indices({}, [1, 2])
-    {}
-
-    """
-    # This function feels inelegant...
-    if not mapping:
-        return {}
-    out = {}
-    j = 0
-    for i in range(max(mapping) + 1):
-        if i in mapping:
-            out[j] = mapping[i]
-        if i in doubled_indices:
-            j += 1
-            if i in mapping:
-                out[j] = mapping[i]
-        j += 1
-    return out
-
-
-def growing_cardinality_handler(
-    src_pcs: t.Sequence[PitchClass],
-    dst_pcs: t.Sequence[PitchClass],
-    *args,
-    sort: bool = True,
-    exclude_motions: t.Optional[t.Dict[int, t.List[int]]] = None,
-    max_motions_up: t.Optional[t.Dict[int, int]] = None,
-    max_motions_down: t.Optional[t.Dict[int, int]] = None,
-    **kwargs,
-) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
-    # This algorithm has horrible complexity but in practice I think that
-    # chords are small enough (we will almost always be going from 3 to 4
-    # notes) that it doesn't really matter. But nevertheless, if you are
-    # voice-leading between chords of like ~20 elements, don't use this!
-
-    card1, card2 = len(src_pcs), len(dst_pcs)
-    excess = card2 - card1
-    if excess > card1:
-        raise CardinalityDiffersTooMuch(
-            f"chord1 has {card1} two items; chord2 has {card2} items; "
-            "when increasing cardinality, the number of items can differ by "
-            "at most the number of items in chord1"
-        )
-    least_displacement = 2**31
-    best_vls, best_indices = [], []
-
-    if exclude_motions is None:
-        exclude_motions = {}
-    if max_motions_up is None:
-        max_motions_up = {}
-    if max_motions_down is None:
-        max_motions_down = {}
-
-    previously_doubled_ps: t.Set[t.Tuple[int, ...]] = set()  # Only used if sort==True
-
-    for doubled_indices in combinations(range(card1), excess):
-        if sort:
-            doubled_ps = tuple(src_pcs[i] for i in doubled_indices)
-            if doubled_ps in previously_doubled_ps:
-                continue
-            previously_doubled_ps.add(doubled_ps)
-        temp_chord = []
-        for i, p in enumerate(src_pcs):
-            temp_chord.extend([p, p] if i in doubled_indices else [p])
-        vls, total_displacement = efficient_pc_voice_leading(
-            temp_chord,
-            dst_pcs,
-            *args,
-            exclude_motions=_remap_from_doubled_indices(
-                exclude_motions, doubled_indices
-            ),
-            max_motions_up=_remap_from_doubled_indices(max_motions_up, doubled_indices),
-            max_motions_down=_remap_from_doubled_indices(
-                max_motions_down, doubled_indices
-            ),
-            **kwargs,
-        )
-        if total_displacement < least_displacement:
-            best_indices = [doubled_indices]
-            best_vls = [vls]
-            least_displacement = total_displacement
-        elif total_displacement == least_displacement:
-            best_indices.append(doubled_indices)
-            best_vls.append(vls)
-
-    out = []
-    for indices, vls in zip(best_indices, best_vls):
-        for vl in vls:
-            vl_out = []
-            vl_i = 0
-            for i in range(card1):
-                if i in indices:
-                    vl_out.append((vl[vl_i], vl[vl_i + 1]))
-                    vl_i += 2
-                else:
-                    vl_out.append(vl[vl_i])
-                    vl_i += 1
-            out.append(tuple(vl_out))
-    return out, least_displacement
-
-
-def _remap_from_omitted_indices(
-    mapping: t.Dict[int, t.Any], omitted_indices: t.Sequence[int]
-):
-    """Used by shrinking_cardinality_handler()
-
-    >>> _remap_from_omitted_indices({0:"a", 1:"b", 2:"c"}, [1,])
-    {0: 'a', 1: 'c'}
-
-    >>> _remap_from_omitted_indices({0:"a", 2:"c"}, [1,])
-    {0: 'a', 1: 'c'}
-
-    >>> _remap_from_omitted_indices({0:"a", 1:"b", 2:"c"}, [3,])
-    {0: 'a', 1: 'b', 2: 'c'}
-
-    >>> _remap_from_omitted_indices({}, [1, 2])
-    {}
-    """
-    # This function feels inelegant...
-    if not mapping:
-        return {}
-    out = {}
-    j = 0
-    for i in range(max(mapping) + 1):
-        if i in mapping:
-            out[j] = mapping[i]
-        if i in omitted_indices:
-            j -= 1
-        j += 1
-    return out
-
-
-def shrinking_cardinality_handler(
-    src_pcs: t.Sequence[PitchClass],
-    dst_pcs: t.Sequence[PitchClass],
-    *args,
-    sort: bool = True,
-    exclude_motions: t.Optional[t.Dict[int, t.List[int]]] = None,
-    max_motions_up: t.Optional[t.Dict[int, int]] = None,
-    max_motions_down: t.Optional[t.Dict[int, int]] = None,
-    **kwargs,
-) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
-    card1, card2 = len(src_pcs), len(dst_pcs)
-    excess = card1 - card2
-    if excess > card2:
-        raise CardinalityDiffersTooMuch(
-            f"chord1 has {card1} two items; chord2 has {card2} items; "
-            "when decreasing cardinality, the number of items can differ by "
-            "at most the number of items in chord2"
-        )
-    least_displacement = 2**31
-    best_vls, best_indices = [], []
-
-    if exclude_motions is None:
-        exclude_motions = {}
-    if max_motions_up is None:
-        max_motions_up = {}
-    if max_motions_down is None:
-        max_motions_down = {}
-
-    previously_omitted_ps: t.Set[t.Tuple[int, ...]] = set()  # Only used if sort==True
-
-    for omitted_indices in combinations(range(card1), excess):
-        if sort:
-            omitted_ps = tuple(src_pcs[i] for i in omitted_indices)
-            if omitted_ps in previously_omitted_ps:
-                continue
-            previously_omitted_ps.add(omitted_ps)
-        temp_chord = [p for (i, p) in enumerate(src_pcs) if i not in omitted_indices]
-        vls, total_displacement = efficient_pc_voice_leading(
-            temp_chord,
-            dst_pcs,
-            *args,
-            sort=sort,
-            exclude_motions=_remap_from_omitted_indices(
-                exclude_motions, omitted_indices
-            ),
-            max_motions_up=_remap_from_omitted_indices(max_motions_up, omitted_indices),
-            max_motions_down=_remap_from_omitted_indices(
-                max_motions_down, omitted_indices
-            ),
-            **kwargs,
-        )
-        if total_displacement < least_displacement:
-            best_indices = [omitted_indices]
-            best_vls = [vls]
-            least_displacement = total_displacement
-        elif total_displacement == least_displacement:
-            best_indices.append(omitted_indices)
-            best_vls.append(vls)
-    out = []
-    for indices, vls in zip(best_indices, best_vls):
-        for vl in vls:
-            vl_out = []
-            vl_i = 0
-            for i in range(card1):
-                if i in indices:
-                    vl_out.append(None)
-                else:
-                    vl_out.append(vl[vl_i])
-                    vl_i += 1
-            out.append(tuple(vl_out))
-    return out, least_displacement
-
-
-def different_cardinality_handler(
-    src_pcs: t.Sequence[PitchClass], dst_pcs: t.Sequence[PitchClass], *args, **kwargs
-) -> t.Tuple[t.List[VoiceLeadingMotion], int]:
-    if len(src_pcs) > len(dst_pcs):
-        return shrinking_cardinality_handler(src_pcs, dst_pcs, *args, **kwargs)
-    return growing_cardinality_handler(src_pcs, dst_pcs, *args, **kwargs)
-
-
-# TODO: (Malcolm) rather than using this function for pitch voice-leading, I may want
-# to use a new function (in particular this function will never produce intervals > 6)
-def efficient_pc_voice_leading(
-    src_pcs: t.Sequence[PitchClass],
-    dst_pcs: t.Sequence[PitchClass],
-    *,
-    tet: int = 12,
-    displacement_more_than: t.Optional[int] = None,
-    exclude_motions: t.Optional[t.Dict[int, t.List[int]]] = None,
-    max_motions_up: t.Optional[t.Dict[int, int]] = None,
-    max_motions_down: t.Optional[t.Dict[int, int]] = None,
-    allow_different_cards: bool = False,
-    sort: bool = True,
-) -> EquivalentVoiceLeadingMotions:
-    """Returns efficient voice-leading(s) between two chords.
-
-    >>> src_pcs = [7, 0, 2]
-    >>> dst_pcs = [4, 8, 11]
-    >>> vl_motions, total_displacement = efficient_pc_voice_leading(src_pcs, dst_pcs)
-    >>> vl_motions
-    [(1, -1, 2)]
-    >>> total_displacement
-    4
-
-    >>> src_pcs = (7, 2, 7)
-    >>> dst_pcs = (0, 4, 7)
-    >>> efficient_pc_voice_leading(src_pcs, dst_pcs)
-    ([(-3, -2, 0)], 5)
-    >>> efficient_pc_voice_leading(src_pcs, dst_pcs, sort=False)
-    ([(-3, -2, 0), (0, -2, -3)], 5)
-
-    Keyword args:
-        displacement_more_than: optional int; voice-leading will be enforced to
-            have a greater total displacement than this interval.
-        exclude_motions: optional dict of form int: list[int]. The note in
-            chord1 whose index matches the key will be prevented from proceeding
-            by any interval in the list.
-        max_motions_up: optional dict. The note in chord1 whose index matches key
-            can ascend by at most the indicated interval in the list.
-        max_motions_down: optional dict. The note in chord1 whose index matches key
-            can descend by at most the indicated interval in the list. (These
-            intervals should be negative.)
-        allow_different_cards: if True, then will provide voice-leadings for
-            chords of different cardinalities. (Otherwise, raises a ValueError.)
-            If this occurs, the returned
-        sort: if True, then if chord1 contains any unisons, the voice-
-            leadings applied to those unisons will be sorted in ascending
-            order. Note that this means that `exclude_motions` and similar may
-            fail (at least until the implementation gets more robust) if one
-            of the pitches of the unison has an excluded motion but the others
-            do not.
-
-    Returns:
-        Two-tuple consisting of
-            - a list of voice-leadings. (A list because there may be more than
-                one equally-efficient voice-leading.)
-
-                Each voice leading is a tuple. The elements of the tuple can
-                be ints, tuples of ints (in the case of a voice-leading to a
-                chord of larger cardinality) or None (in the case of a voice-
-                leading to a chord of smaller cardinality).
-            - integer indicating the total displacement.
-
-    Raises:
-        NoMoreVoiceLeadingsError if there is no voice leading that satisfies
-            displacement_more_than and exclude_motions
-
-
-    """
-
-    if displacement_more_than is None:
-        displacement_more_than = -1
-    if exclude_motions is None:
-        exclude_motions = {}
-    if max_motions_down is None:
-        max_motions_down = {}
-    if max_motions_up is None:
-        max_motions_up = {}
-
-    def _voice_leading_sub(in_indices, out_indices, current_sum):
-        """This is a recursive function for calculating most efficient
-        voice leadings.
-
-        The idea is that a bijective voice-leading between two
-        ordered chords can be represented by a single set of indexes,
-        where the first index *x* maps the first note of the first chord
-        on to the *x*th note of the second chord, and so on.
-
-        Should be initially called as follows:
-            _voice_leading_sub(list(range(cardinality of chords)),
-                               [],
-                               0)
-
-        The following variables are found in the enclosing scope:
-            chord1
-            chord2
-            best_sum
-            best_vl_indices
-            halftet
-            tet
-            displacement_more_than
-
-        """
-        # LONGTERM try multisets somehow?
-        nonlocal best_sum, best_vl_indices
-        if not in_indices:
-            if current_sum > displacement_more_than:
-                if best_sum > current_sum:
-                    best_sum = current_sum
-                    best_vl_indices = [out_indices]
-                elif best_sum == current_sum:
-                    best_vl_indices.append(out_indices)
-        else:
-            chord1_i = len(out_indices)
-            this_p = src_pcs[chord1_i]
-            unique = not any((this_p == p) for p in src_pcs[:chord1_i])
-            for i, chord2_i in enumerate(in_indices):
-                motion = dst_pcs[chord2_i] - src_pcs[chord1_i]
-                if motion > halftet:
-                    motion -= tet
-                elif motion < -halftet:
-                    motion += tet
-                if chord1_i in max_motions_up:
-                    if motion > max_motions_up[chord1_i]:
-                        continue
-                if chord1_i in max_motions_down:
-                    if motion < max_motions_down[chord1_i]:
-                        continue
-                if chord1_i in exclude_motions:
-                    if motion in exclude_motions[chord1_i]:
-                        #      MAYBE expand to include combinations of
-                        #       multiple voice leading motions
-                        continue
-                displacement = abs(motion)
-                present_sum = current_sum + displacement
-                if present_sum > best_sum:
-                    continue
-                _voice_leading_sub(
-                    in_indices[:i] + in_indices[i + 1 :],
-                    out_indices + [chord2_i],
-                    present_sum,
-                )
-                if not unique:
-                    # if the pitch-class is not unique, all other mappings of
-                    # it will already have been checked in the recursive calls,
-                    # and so we can break here
-                    # TODO: (Malcolm) I'm not sure that this is correct; what about
-                    # cases of tripled tones etc.?
-                    break
-
-    card = len(src_pcs)
-    if card != len(dst_pcs):
-        if allow_different_cards:
-            return different_cardinality_handler(
-                src_pcs,
-                dst_pcs,
-                tet=tet,
-                displacement_more_than=displacement_more_than,
-                exclude_motions=exclude_motions,
-                max_motions_up=max_motions_up,
-                max_motions_down=max_motions_down,
-                sort=sort,
-            )
-        raise ValueError(f"{src_pcs} and {dst_pcs} have different lengths.")
-
-    best_sum = starting_sum = tet**8
-    best_vl_indices = []
-    halftet = tet // 2
-
-    _voice_leading_sub(list(range(card)), [], 0)
-
-    # If best_sum hasn't changed, then we haven't found any
-    # voice-leadings.
-    if best_sum == starting_sum:
-        raise NoMoreVoiceLeadingsError
-
-    # When there are unisons in chord2, there can be duplicate voice-leadings.
-    # There is probably a more efficient way of avoiding generating these in
-    # the first place, but for now, we get rid of them by casting to a set.
-    voice_leading_intervals = list(
-        {indices_to_vl(indices, src_pcs, dst_pcs, tet) for indices in best_vl_indices}
-    )
-
-    if len(voice_leading_intervals) > 1:
-        voice_leading_intervals.sort(key=np.var)
-
-    if sort:
-        unisons = tuple(p for p in set(src_pcs) if src_pcs.count(p) > 1)
-        unison_indices = tuple(
-            tuple(i for i, p1 in enumerate(src_pcs) if p1 == p2) for p2 in unisons
-        )
-        for j, vl in enumerate(voice_leading_intervals):
-            vl_copy = list(vl)
-            for indices in unison_indices:
-                motions = [vl[i] for i in indices]
-                motions.sort()
-                for i, m in zip(indices, motions):
-                    vl_copy[i] = m
-            voice_leading_intervals[j] = tuple(vl_copy)
-
-        voice_leading_intervals = list(set(voice_leading_intervals))
-
-    return voice_leading_intervals, best_sum  # type:ignore
-
-
-def efficient_pc_voice_leading_iter(
-    *args, **kwargs
-) -> t.Iterator[EquivalentVoiceLeadingMotions]:
-    """
-    >>> src_pcs = (7, 2, 7)
-    >>> dst_pcs = (0, 4, 7)
-    >>> vl_iter = efficient_pc_voice_leading_iter(src_pcs, dst_pcs)
-    >>> next(vl_iter)[0], next(vl_iter)[0]
-    ([(-3, -2, 0)], [(0, 2, 5)])
-    """
-    displacement_more_than = kwargs.pop("displacement_more_than", -1)
-    while True:
-        try:
-            vl_motions, total_displacement = efficient_pc_voice_leading(
-                *args, displacement_more_than=displacement_more_than, **kwargs
-            )
-            yield vl_motions, total_displacement
-            displacement_more_than = total_displacement
-        except NoMoreVoiceLeadingsError:
-            return
