@@ -42,7 +42,7 @@ def test_remove_synonyms():
 
 
 @pytest.mark.parametrize(
-    "ps, ref_pcs",
+    "src_pitches, dst_pcs",
     (
         ((48, 64, 67, 70), (5, 9, 0)),
         ((48, 48, 52, 55), (2, 5, 7, 11)),
@@ -54,37 +54,40 @@ def test_remove_synonyms():
         # ((48, 48, 52, 58), (7, 11)),
     ),
 )
-@pytest.mark.parametrize("preserve_root", (True, False))
-@pytest.mark.parametrize("avoid_bass_crossing", (True, False))
+# @pytest.mark.parametrize("preserve_bass", (True, False))
+# @pytest.mark.parametrize("avoid_bass_crossing", (True, False))
+@pytest.mark.parametrize(
+    "preserve_bass, avoid_bass_crossing", ((True, True), (False, True), (False, False))
+)
 @pytest.mark.parametrize(
     "min_pitch, max_pitch", ((False, False), (True, False), (False, True))
 )
 def test_voice_lead_pitches(
-    ps, ref_pcs, preserve_root, avoid_bass_crossing, min_pitch, max_pitch
+    src_pitches, dst_pcs, preserve_bass, avoid_bass_crossing, min_pitch, max_pitch
 ):
-    min_pitch = min(ps) if min_pitch else None
-    max_pitch = max(ps) + 2 if max_pitch else None
+    min_pitch = min(src_pitches) if min_pitch else None
+    max_pitch = max(src_pitches) + 2 if max_pitch else None
     min_bass_pitch = min_pitch - 12 if min_pitch is not None else None
-    for start_i in range(len(ref_pcs)):
-        pcs = ref_pcs[start_i:] + ref_pcs[:start_i]
+    for start_i in range(len(dst_pcs)):
+        dst_pcs_rotation = dst_pcs[start_i:] + dst_pcs[:start_i]
         out = voice_lead_pitches(
-            ps,
-            pcs,
-            preserve_root=preserve_root,
+            src_pitches,
+            dst_pcs_rotation,
+            preserve_bass=preserve_bass,
             return_first=False,
             avoid_bass_crossing=avoid_bass_crossing,
             min_pitch=min_pitch,
             max_pitch=max_pitch,
             min_bass_pitch=min_bass_pitch,
         )
-        if preserve_root:
-            assert out[0] % 12 == pcs[0]
+        if preserve_bass:
+            assert out[0] % 12 == dst_pcs_rotation[0]
         if avoid_bass_crossing:
-            if preserve_root:
+            if preserve_bass:
                 # TODO: (Malcolm) remove check for preserve root after implementing
                 assert out[0] <= out[1]
-        assert len(out) == len(pcs)
-        assert {pc % 12 for pc in out} == set(pcs)
+        assert len(out) == len(dst_pcs_rotation)
+        assert {pc % 12 for pc in out} == set(dst_pcs_rotation)
         if min_pitch is not None and len(out) > 1:
             assert min(out[1:]) >= min_pitch
         if min_bass_pitch is not None:

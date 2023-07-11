@@ -68,41 +68,51 @@ def get_vl_atom_displacement(vl_atom: VoiceLeadingAtom) -> int:
 
 def apply_vl(
     vl: VoiceLeadingMotion, chord: t.Sequence[int]
-) -> t.Tuple[t.List[int], VoiceAssignments]:
+) -> t.Tuple[t.Tuple[int], VoiceAssignments]:
     """
     `VoiceAssignments` are relative to the notes in `chord`. Not sure if this is exactly
     what we want.
 
     >>> apply_vl(vl=(0, 1, 2), chord=(60, 64, 67))
-    ([60, 65, 69], (0, 1, 2))
+    ((60, 65, 69), (0, 1, 2))
 
     >>> apply_vl(vl=(-3, 1, None), chord=(60, 64, 67))
-    ([57, 65], (0, 1))
+    ((57, 65), (0, 1))
 
     >>> apply_vl(vl=((-3, 0), (-1, 1), 2), chord=(60, 64, 67))
-    ([57, 60, 63, 65, 69], (0, 0, 1, 1, 2))
+    ((57, 60, 63, 65, 69), (0, 0, 1, 1, 2))
 
-    # >>> apply_vl(vl=(-3, 0), chord=(60, 64, 67))
-    # Traceback (innermost last):
-    # AssertionError
+    The returned pitches are sorted in ascending order:
+    >>> apply_vl(vl=(5, -4, 2), chord=(60, 64, 67))
+    ((60, 65, 69), (1, 0, 2))
+
+    # >>> apply_vl(vl=(-3, 0), chord=(60, 64, 67))  # +doctest: IGNORE_EXCEPTION_DETAIL
+    # Traceback (most recent call last):
+    # AssertionError:
 
     # Raises:
     #     AssertionError if len(vl) != len(chord)
     """
     assert len(vl) == len(chord)
-    pitches = []
-    voice_assignments = []
+
+    out = []
     for i, motion in enumerate(vl):
         if isinstance(motion, tuple):
             for m in motion:
-                pitches.append((chord[i] + m))
-                voice_assignments.append(i)
+                pitch = chord[i] + m
+                voice_assignment = i
+                out.append((pitch, voice_assignment))
         elif motion is None:
             continue
         else:
-            pitches.append((chord[i] + motion))
-            voice_assignments.append(i)
-    return pitches, tuple(voice_assignments)
+            pitch = chord[i] + motion
+            voice_assignment = i
+            out.append((pitch, voice_assignment))
+
+    # Sort by pitch
+    out.sort(key=lambda x: x[0])
+
+    return tuple(zip(*out))
 
 
 def indices_to_vl(
@@ -136,7 +146,7 @@ def indices_to_vl(
     return tuple(voice_leading)
 
 
-def get_preserve_root_vl_atom(
+def get_preserve_bass_vl_atom(
     src_pitches: t.Sequence[Pitch],
     dst_pcs: t.Sequence[PitchClass],
     min_bass_pitch: t.Optional[int] = None,
@@ -150,15 +160,15 @@ def get_preserve_root_vl_atom(
 
     If `min_bass_pitch` and `max_bass_pitch` arguments are not provided, we return the
     next lower/higher pitches respectively.
-    >>> list(get_preserve_root_vl_atom(src_pitches, dst_pcs))
+    >>> list(get_preserve_bass_vl_atom(src_pitches, dst_pcs))
     [5, -7]
-    >>> list(get_preserve_root_vl_atom(src_pitches, dst_pcs, max_bass_pitch=59))
+    >>> list(get_preserve_bass_vl_atom(src_pitches, dst_pcs, max_bass_pitch=59))
     [-7]
-    >>> list(get_preserve_root_vl_atom(src_pitches, dst_pcs, min_bass_pitch=49))
+    >>> list(get_preserve_bass_vl_atom(src_pitches, dst_pcs, min_bass_pitch=49))
     [5]
-    >>> list(get_preserve_root_vl_atom(src_pitches, dst_pcs, min_bass_pitch=49, max_bass_pitch=59))
+    >>> list(get_preserve_bass_vl_atom(src_pitches, dst_pcs, min_bass_pitch=49, max_bass_pitch=59))
     []
-    >>> list(get_preserve_root_vl_atom(src_pitches, dst_pcs, min_bass_pitch=32, max_bass_pitch=84))
+    >>> list(get_preserve_bass_vl_atom(src_pitches, dst_pcs, min_bass_pitch=32, max_bass_pitch=84))
     [5, -7, 17, -19, 29]
     """
     src_root_pitch = src_pitches[0]
@@ -409,13 +419,21 @@ def ignore_voice_assignments_wrapper(
 
 
 def efficient_pitch_voice_leading_iter(
-    chord1_pitches: t.Sequence[Pitch],
-    chord2_pcs: t.Sequence[PitchClass],
+    src_pitches: t.Sequence[Pitch],
+    dst_pcs: t.Sequence[PitchClass],
     tet: int = 12,
     allow_different_cards: bool = True,
     min_pitch: t.Optional[int] = None,
     max_pitch: t.Optional[int] = None,
-):
+) -> t.Iterator[EquivalentVoiceLeadingMotions]:
+    """
+    >>> src_pitches = (55, 62, 67)
+    >>> dst_pcs = (0, 4, 7)
+    >>> vl_iter = efficient_pitch_voice_leading_iter(src_pitches, dst_pcs)
+    >>> next(vl_iter)[0], next(vl_iter)[0]
+    ([(-3, -2, 0), (0, -2, -3)], [(5, 2, 0), (0, 2, 5)])
+    """
+
     def _get_max_motions_up(pitches):
         if max_pitch is None:
             return None
@@ -427,12 +445,13 @@ def efficient_pitch_voice_leading_iter(
         return {i: min_pitch - pitch for i, pitch in enumerate(pitches)}
 
     return efficient_pc_voice_leading_iter(
-        [p % tet for p in chord1_pitches],
-        chord2_pcs,
+        [p % tet for p in src_pitches],
+        dst_pcs,
         tet=tet,
         allow_different_cards=allow_different_cards,
-        max_motions_down=_get_max_motions_down(chord1_pitches),
-        max_motions_up=_get_max_motions_up(chord1_pitches),
+        max_motions_down=_get_max_motions_down(src_pitches),
+        max_motions_up=_get_max_motions_up(src_pitches),
+        sort=False,
     )
 
 
@@ -453,13 +472,13 @@ def preserve_and_split_root_vl_iters(
     >>> [next(vl_iter) for vl_iter in vl_iters]
     [([((2, 5), 3, 4)], 14), ([((-10, -1), 1, 0)], 12)]
     """
-    # Since `preserve_root` is True, if we are splitting the bass, one of
+    # Since `preserve_bass` is True, if we are splitting the bass, one of
     # the bass voice-leading motions must be the two roots, and the root of
     # the second chord must be lower than the other parts.
     if max_bass_pitch is None:
         max_bass_pitch = max_pitch
 
-    root_motions = get_preserve_root_vl_atom(
+    root_motions = get_preserve_bass_vl_atom(
         src_pitches,
         dst_pcs,
         min_bass_pitch=min_bass_pitch,
@@ -484,7 +503,7 @@ def preserve_and_split_root_vl_iters(
     return vl_iters
 
 
-def preserve_root_vl_iters(
+def preserve_bass_vl_iters(
     src_pitches: t.Sequence[Pitch],
     dst_pcs: t.Sequence[PitchClass],
     avoid_bass_crossing: bool = True,
@@ -499,20 +518,21 @@ def preserve_root_vl_iters(
 
     >>> src_pitches = [60, 64, 67]
     >>> dst_pcs = [5, 8, 0]
-    >>> vl_iters = preserve_root_vl_iters(src_pitches, dst_pcs)
+    >>> vl_iters = preserve_bass_vl_iters(src_pitches, dst_pcs)
     >>> [next(vl_iter) for vl_iter in vl_iters]
     [([(5, 4, 5)], 14), ([(-7, -4, 1)], 12)]
 
     >>> src_pitches = [60, 64, 67]
     >>> dst_pcs = [2, 5, 7, 11]
-    >>> vl_iters = preserve_root_vl_iters(src_pitches, dst_pcs)
+    >>> vl_iters = preserve_bass_vl_iters(src_pitches, dst_pcs)
     >>> [next(vl_iter) for vl_iter in vl_iters]
     [([(2, 1, (0, 4))], 7), ([(-10, 1, (0, 4))], 15)]
+
     """
     if max_bass_pitch is None:
         max_bass_pitch = max_pitch
 
-    root_motions = get_preserve_root_vl_atom(
+    root_motions = get_preserve_bass_vl_atom(
         src_pitches,
         dst_pcs,
         min_bass_pitch=min_bass_pitch,
@@ -537,7 +557,7 @@ def preserve_root_vl_iters(
     return vl_iters
 
 
-def dont_preserve_root_vl_iters(
+def dont_preserve_bass_vl_iters(
     src_pitches: t.Sequence[Pitch],
     dst_pcs: t.Sequence[PitchClass],
     avoid_bass_crossing: bool = True,
@@ -548,7 +568,7 @@ def dont_preserve_root_vl_iters(
 
     >>> src_pitches = [60, 64, 67]
     >>> dst_pcs = [2, 5, 7, 11]
-    >>> vl_iters = dont_preserve_root_vl_iters(src_pitches, dst_pcs)
+    >>> vl_iters = dont_preserve_bass_vl_iters(src_pitches, dst_pcs)
     >>> [next(vl_iter) for vl_iter in vl_iters]
     [([((-1, 2), 1, 0), (-1, (-2, 1), 0)], 4)]
     """
@@ -560,17 +580,17 @@ def dont_preserve_root_vl_iters(
 
     if avoid_bass_crossing:
         LOGGER.warning(
-            "`dont_preserve_root_vl_iters()` called with "
+            "`dont_preserve_bass_vl_iters()` called with "
             "`avoid_bass_crossing=True`. This parameter is not implemented yet and "
             "will have no effect."
         )
     return [efficient_pitch_voice_leading_iter(src_pitches, dst_pcs, **vl_kwargs)]
 
 
-def voice_lead_pitches_iter(
+def get_voice_lead_pitches_iters(
     chord1_pitches: t.Sequence[Pitch],
     chord2_pcs: t.Sequence[PitchClass],
-    preserve_root: bool = False,
+    preserve_bass: bool = False,
     avoid_bass_crossing: bool = True,
     tet: int = 12,
     allow_different_cards: bool = True,
@@ -578,25 +598,14 @@ def voice_lead_pitches_iter(
     max_pitch: t.Optional[int] = None,
     min_bass_pitch: t.Optional[int] = None,
     max_bass_pitch: t.Optional[int] = None,
-    ignore_voice_assignments: bool = True,
-) -> t.Iterator[t.Tuple[t.Sequence[Pitch], VoiceAssignments]]:
+) -> t.List[t.Iterator[EquivalentVoiceLeadingMotions]]:
     """
-    >>> chord1_pitches = [60, 64, 67]
-    >>> chord2_pcs = [2, 5, 7, 11]
-    >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs)
-    >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
-    ([59, 62, 65, 67], [62, 65, 67, 71], [59, 65, 62, 67])
-
-    If `ignore_voice_assignments` is True, then voice-leadings that result in exactly
-    the same pitches (differing only in which voice is led where) are considered
-    equivalent and not returned separately.
-
-    >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs,
-    ...                                   ignore_voice_assignments=False)
-    >>> next(vl_iter), next(vl_iter)
-    (([59, 62, 65, 67], (0, 0, 1, 2)), ([59, 62, 65, 67], (0, 1, 1, 2)))
+    >>> chord1_pitches = (47, 55, 62, 67)
+    >>> chord2_pcs = (0, 0, 4, 7)
+    >>> vl_iter = get_voice_lead_pitches_iters(chord1_pitches, chord2_pcs, preserve_bass=True)
+    >>> [next(v) for v in vl_iter]
+    [([(1, -3, -2, 0), (1, 0, -2, -3)], 6), ([(-11, -3, -2, 0), (-11, 0, -2, -3)], 16)]
     """
-
     subroutine_kwargs = {
         "avoid_bass_crossing": avoid_bass_crossing,
         "tet": tet,
@@ -607,10 +616,16 @@ def voice_lead_pitches_iter(
         "max_bass_pitch": max_bass_pitch,
     }
 
-    if preserve_root and len(chord1_pitches) < len(chord2_pcs):
+    if preserve_bass and not avoid_bass_crossing:
+        LOGGER.warning(
+            "`preserve_bass=True` and `avoid_bass_crossing=False`: bass is not "
+            "guaranteed to be preserved"
+        )
+
+    if preserve_bass and len(chord1_pitches) < len(chord2_pcs):
         # If chord1 has fewer pitches than chord2 has pcs, then at least
         # one pitch from chord1 will be "split" into multiple pitches in
-        # chord2. Ordinarily when preserve_root is True, we exclude the
+        # chord2. Ordinarily when preserve_bass is True, we exclude the
         # root from the voice-leading calculation, but since we might
         # want to split the root, we need to try including it here.
 
@@ -618,8 +633,6 @@ def voice_lead_pitches_iter(
         # Case 1: split root
         # -----------------------------------------------------------------------
 
-        # root_motions = get_preserve_root_vl_atom(chord1_pitches, chord2_pcs)
-        # get_split_root_voice_leadings(root_motions, chord1_pitches, chord2_pcs)
         split_root_iters = preserve_and_split_root_vl_iters(
             chord1_pitches, chord2_pcs, **subroutine_kwargs
         )
@@ -627,19 +640,81 @@ def voice_lead_pitches_iter(
         # -----------------------------------------------------------------------
         # Case 2: don't split root
         # -----------------------------------------------------------------------
-        dont_split_root_iters = preserve_root_vl_iters(
+
+        dont_split_root_iters = preserve_bass_vl_iters(
             chord1_pitches, chord2_pcs, **subroutine_kwargs
         )
         vl_iters = split_root_iters + dont_split_root_iters
 
-    elif preserve_root:
-        vl_iters = preserve_root_vl_iters(
+    elif preserve_bass:
+        vl_iters = preserve_bass_vl_iters(
             chord1_pitches, chord2_pcs, **subroutine_kwargs
         )
     else:
-        vl_iters = dont_preserve_root_vl_iters(
+        vl_iters = dont_preserve_bass_vl_iters(
             chord1_pitches, chord2_pcs, **subroutine_kwargs
         )
+    return vl_iters
+
+
+def voice_lead_pitches_multiple_options_iter(
+    chord1_pitches: t.Sequence[Pitch],
+    chord2_pcs_options: t.Iterator[t.Sequence[PitchClass]],
+    ignore_voice_assignments: bool = True,
+    **get_voice_lead_pitches_iters_kwargs,
+) -> t.Iterator[t.Tuple[t.Sequence[Pitch], VoiceAssignments]]:
+    """
+    >>> chord1_pitches = [60, 64, 67]
+    >>> chord2_pcs_options = [[2, 5, 7, 11], [5, 7, 11], [2, 5, 7]]
+    >>> vl_iter = voice_lead_pitches_multiple_options_iter(chord1_pitches, chord2_pcs_options)
+    >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
+    ((59, 65, 67), (62, 65, 67), (59, 62, 65, 67))
+    """
+    vl_iters = []
+    for chord2_pcs in chord2_pcs_options:
+        vl_iters += get_voice_lead_pitches_iters(
+            chord1_pitches, chord2_pcs, **get_voice_lead_pitches_iters_kwargs
+        )
+    apply_iter = apply_next_vl_from_vl_iters(vl_iters, chord1_pitches)
+
+    if ignore_voice_assignments:
+        apply_iter = ignore_voice_assignments_wrapper(apply_iter)
+
+    yield from apply_iter
+
+
+# TODO: (Malcolm) rename preserve_bass to the more accurate preserve_bass
+def voice_lead_pitches_iter(
+    chord1_pitches: t.Sequence[Pitch],
+    chord2_pcs: t.Sequence[PitchClass],
+    ignore_voice_assignments: bool = True,
+    **get_voice_lead_pitches_iters_kwargs,
+) -> t.Iterator[t.Tuple[t.Sequence[Pitch], VoiceAssignments]]:
+    """
+    >>> chord1_pitches = [60, 64, 67]
+    >>> chord2_pcs = [2, 5, 7, 11]
+    >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs)
+    >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
+    ((59, 62, 65, 67), (62, 65, 67, 71), (55, 62, 65, 71))
+
+    If `ignore_voice_assignments` is True, then voice-leadings that result in exactly
+    the same pitches (differing only in which voice is led where) are considered
+    equivalent and not returned separately.
+
+    >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs,
+    ...                                   ignore_voice_assignments=False)
+    >>> next(vl_iter), next(vl_iter)
+    (((59, 62, 65, 67), (0, 0, 1, 2)), ((59, 62, 65, 67), (0, 1, 1, 2)))
+
+    >>> chord1_pitches = (47, 55, 62, 67)
+    >>> chord2_pcs = (0, 0, 4, 7)
+    >>> vl_iter = voice_lead_pitches_iter(chord1_pitches, chord2_pcs, preserve_bass=True)
+    >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
+    ((48, 52, 60, 67), (48, 55, 60, 64), (48, 60, 64, 67))
+    """
+    vl_iters = get_voice_lead_pitches_iters(
+        chord1_pitches, chord2_pcs, **get_voice_lead_pitches_iters_kwargs
+    )
 
     apply_iter = apply_next_vl_from_vl_iters(vl_iters, chord1_pitches)
 
@@ -652,7 +727,7 @@ def voice_lead_pitches_iter(
 def voice_lead_pitches(
     chord1_pitches: t.Sequence[Pitch],
     chord2_pcs: t.Sequence[PitchClass],
-    preserve_root: bool = False,
+    preserve_bass: bool = False,
     avoid_bass_crossing: bool = True,
     tet: int = 12,
     allow_different_cards: bool = True,
@@ -664,45 +739,54 @@ def voice_lead_pitches(
 ) -> t.Sequence[Pitch]:
     """
     >>> voice_lead_pitches([60, 64, 67], [5, 8, 0])
-    [60, 65, 68]
-    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_root=True)
-    [53, 60, 68]
+    (60, 65, 68)
+    >>> voice_lead_pitches([60, 64, 67], [5, 8, 0], preserve_bass=True)
+    (53, 60, 68)
 
-    If preserve_root is True, the bass voice can exceed 'min_pitch'
+    >>> voice_lead_pitches([60, 64, 67], [0, 4, 9], preserve_bass=True)
+    (60, 64, 69)
+
+    If preserve_bass is True, the bass voice can exceed 'min_pitch'
 
     >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], min_pitch=60)
-    [62, 67, 71]
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_root=True,
+    (62, 67, 71)
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
     ...     min_pitch=60)
-    [55, 62, 71]
+    (55, 62, 71)
 
-    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_root=True,
+    TODO what happens with min_bass_pitch?
+    # >>> voice_lead_pitches([60, 64, 67], [7, 11, 2], preserve_bass=True,
+    # ...     min_bass_pitch=60)
+    # (55, 62, 71)
+
+    >>> voice_lead_pitches([60, 64, 67], [7, 11, 2, 5], preserve_bass=True,
     ...     min_pitch=60)
-    [55, 62, 65, 71]
+    (55, 62, 65, 71)
 
     Note that when shrinking cardinality, pitches will not be doubled.
-    >>> voice_lead_pitches([64, 65, 67, 71], [0, 4, 7], preserve_root=True)
-    [60, 64, 67]
+    >>> voice_lead_pitches([64, 65, 67, 71], [0, 4, 7], preserve_bass=True)
+    (60, 64, 67)
 
     However, it is possible to double pitch-classes in `chord2_pcs`.
-    >>> voice_lead_pitches([64, 65, 67, 71], [0, 0, 4, 7], preserve_root=True)
-    [60, 64, 67, 72]
+    >>> voice_lead_pitches([64, 65, 67, 71], [0, 0, 4, 7], preserve_bass=True)
+    (60, 64, 67, 72)
     """
     iterator = voice_lead_pitches_iter(
         chord1_pitches,
         chord2_pcs,
-        preserve_root,
-        avoid_bass_crossing,
-        tet,
-        allow_different_cards,
-        min_pitch,
-        max_pitch,
-        min_bass_pitch,
-        max_bass_pitch,
+        preserve_bass=preserve_bass,
+        avoid_bass_crossing=avoid_bass_crossing,
+        tet=tet,
+        allow_different_cards=allow_different_cards,
+        min_pitch=min_pitch,
+        max_pitch=max_pitch,
+        min_bass_pitch=min_bass_pitch,
+        max_bass_pitch=max_bass_pitch,
     )
     if return_first:
         return next(iterator)[0]
 
+    # TODO: (Malcolm) I think we need to constrain the maximum number of options here
     return random.choice(list(iterator))[0]
 
 
@@ -934,6 +1018,8 @@ def different_cardinality_handler(
     return growing_cardinality_handler(src_pcs, dst_pcs, *args, **kwargs)
 
 
+# TODO: (Malcolm) rather than using this function for pitch voice-leading, I may want
+# to use a new function (in particular this function will never produce intervals > 6)
 def efficient_pc_voice_leading(
     src_pcs: t.Sequence[PitchClass],
     dst_pcs: t.Sequence[PitchClass],
@@ -955,6 +1041,13 @@ def efficient_pc_voice_leading(
     [(1, -1, 2)]
     >>> total_displacement
     4
+
+    >>> src_pcs = (7, 2, 7)
+    >>> dst_pcs = (0, 4, 7)
+    >>> efficient_pc_voice_leading(src_pcs, dst_pcs)
+    ([(-3, -2, 0)], 5)
+    >>> efficient_pc_voice_leading(src_pcs, dst_pcs, sort=False)
+    ([(-3, -2, 0), (0, -2, -3)], 5)
 
     Keyword args:
         displacement_more_than: optional int; voice-leading will be enforced to
@@ -1040,7 +1133,7 @@ def efficient_pc_voice_leading(
         else:
             chord1_i = len(out_indices)
             this_p = src_pcs[chord1_i]
-            unique = not any((this_p == p) for p in src_pcs[chord1_i + 1 :])
+            unique = not any((this_p == p) for p in src_pcs[:chord1_i])
             for i, chord2_i in enumerate(in_indices):
                 motion = dst_pcs[chord2_i] - src_pcs[chord1_i]
                 if motion > halftet:
@@ -1071,6 +1164,8 @@ def efficient_pc_voice_leading(
                     # if the pitch-class is not unique, all other mappings of
                     # it will already have been checked in the recursive calls,
                     # and so we can break here
+                    # TODO: (Malcolm) I'm not sure that this is correct; what about
+                    # cases of tripled tones etc.?
                     break
 
     card = len(src_pcs)
@@ -1123,12 +1218,21 @@ def efficient_pc_voice_leading(
                     vl_copy[i] = m
             voice_leading_intervals[j] = tuple(vl_copy)
 
+        voice_leading_intervals = list(set(voice_leading_intervals))
+
     return voice_leading_intervals, best_sum  # type:ignore
 
 
 def efficient_pc_voice_leading_iter(
     *args, **kwargs
 ) -> t.Iterator[EquivalentVoiceLeadingMotions]:
+    """
+    >>> src_pcs = (7, 2, 7)
+    >>> dst_pcs = (0, 4, 7)
+    >>> vl_iter = efficient_pc_voice_leading_iter(src_pcs, dst_pcs)
+    >>> next(vl_iter)[0], next(vl_iter)[0]
+    ([(-3, -2, 0)], [(0, 2, 5)])
+    """
     displacement_more_than = kwargs.pop("displacement_more_than", -1)
     while True:
         try:

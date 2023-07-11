@@ -84,27 +84,39 @@ def get_all_in_range(
     return [pc + octave * tet for octave in range(low_octave, high_octave + 1)]
 
 
-def next_pc_up_from_pitch(pitch: int, pc: int, tet: int = 12) -> int:
+def next_pc_up_from_pitch(
+    pitch: int, pc: int, tet: int = 12, allow_unison: bool = True
+) -> int:
     """
     >>> next_pc_up_from_pitch(62, 0)
     72
     >>> next_pc_up_from_pitch(62, 11)
     71
+    >>> next_pc_up_from_pitch(62, 2)
+    62
+    >>> next_pc_up_from_pitch(62, 2, allow_unison=False)
+    74
     """
     src_octave, src_pc = divmod(pitch, tet)
-    if pc > src_pc:
+    if (pc >= src_pc) if allow_unison else (pc > src_pc):
         return src_octave * tet + pc
     return (src_octave + 1) * tet + pc
 
 
-def next_pc_down_from_pitch(pitch: int, pc: int, tet: int = 12) -> int:
+def next_pc_down_from_pitch(
+    pitch: int, pc: int, tet: int = 12, allow_unison: bool = True
+) -> int:
     """
     >>> next_pc_down_from_pitch(62, 0)
     60
     >>> next_pc_down_from_pitch(62, 11)
     59
+    >>> next_pc_down_from_pitch(62, 2)
+    62
+    >>> next_pc_down_from_pitch(62, 2, allow_unison=False)
+    50
     """
     src_octave, src_pc = divmod(pitch, tet)
-    if pc < src_pc:
+    if (pc <= src_pc) if allow_unison else (pc < src_pc):
         return src_octave * tet + pc
     return (src_octave - 1) * tet + pc
