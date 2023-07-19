@@ -54,8 +54,6 @@ def test_remove_synonyms():
         # ((48, 48, 52, 58), (7, 11)),
     ),
 )
-# @pytest.mark.parametrize("preserve_bass", (True, False))
-# @pytest.mark.parametrize("avoid_bass_crossing", (True, False))
 @pytest.mark.parametrize(
     "preserve_bass, avoid_bass_crossing", ((True, True), (False, True), (False, False))
 )
@@ -83,9 +81,7 @@ def test_voice_lead_pitches(
         if preserve_bass:
             assert out[0] % 12 == dst_pcs_rotation[0]
         if avoid_bass_crossing:
-            if preserve_bass:
-                # TODO: (Malcolm) remove check for preserve root after implementing
-                assert out[0] <= out[1]
+            assert out[0] <= out[1]
         assert len(out) == len(dst_pcs_rotation)
         assert {pc % 12 for pc in out} == set(dst_pcs_rotation)
         if min_pitch is not None and len(out) > 1:
@@ -96,23 +92,27 @@ def test_voice_lead_pitches(
             assert max(out) <= max_pitch
 
 
-def test_efficient_voice_leading():
-    triads = [(0, 3, 7), (0, 4, 7), (0, 1, 2), (0, 4, 8), (0, 2, 6)]
-    doubled_triads = [(0, 0, 3, 7), (0, 0, 4, 7)]
-    tetrads = [(0, 2, 4, 6), (0, 1, 2, 3), (0, 3, 6, 10), (0, 4, 8, 11)]
-    sextads = [(0, 2, 4, 6, 8, 10), (0, 3, 4, 7, 8, 11)]
-    # The following slow the test *way* down
-    # heptads = [(0, 2, 4, 5, 7, 9, 11), (0, 2, 3, 5, 7, 9, 11)]
+TRIADS = [(0, 3, 7), (0, 4, 7), (0, 1, 2), (0, 4, 8), (0, 2, 6)]
+DOUBLED_TRIADS = [(0, 0, 3, 7), (0, 0, 4, 7)]
+TETRADS = [(0, 2, 4, 6), (0, 1, 2, 3), (0, 3, 6, 10), (0, 4, 8, 11)]
+SEXTADS = [(0, 2, 4, 6, 8, 10), (0, 3, 4, 7, 8, 11)]
 
-    chord_pairs = (
-        list(itertools.product(triads + doubled_triads + tetrads, repeat=2))
-        # + list(itertools.product(heptads, repeat=2))
-        + list(itertools.product(sextads, repeat=2))
-    )
+FEW_CHORD_PAIRS = list(itertools.product(TRIADS[:2] + TETRADS[-1:], repeat=2))
+MANY_CHORD_PAIRS = list(
+    itertools.product(TRIADS + DOUBLED_TRIADS + TETRADS, repeat=2)
+) + list(itertools.product(SEXTADS, repeat=2))
 
-    exclude_motions = {1: [0]}
-    max_motions_up = {2: 1}
-    max_motions_down = {3: -1}
+
+@pytest.mark.parametrize(
+    "chord_pairs, exclude_motions, max_motions_up, max_motions_down",
+    (
+        (FEW_CHORD_PAIRS, {}, {}, {}),
+        (MANY_CHORD_PAIRS, {1: [0]}, {2: 1}, {3: -1}),
+    ),
+)
+def test_efficient_voice_leading(
+    chord_pairs, exclude_motions, max_motions_up, max_motions_down
+):
     for c1, c2 in chord_pairs:
         for i in range(12):
             c3 = [(p + i) % 12 for p in c2]
@@ -128,7 +128,7 @@ def test_efficient_voice_leading():
                         max_motions_up=max_motions_up,
                         max_motions_down=max_motions_down,
                         allow_different_cards=True,
-                        sort=False,
+                        normalize=False,
                     )
                 except NoMoreVoiceLeadingsError:
                     break
@@ -153,10 +153,6 @@ def test_efficient_voice_leading():
                             motions = [motions]
                         for motion in motions:
                             assert motion <= interval
-                        # try:
-                        #     assert vl[note_i] <= interval
-                        # except IndexError:
-                        #     pass
                     for note_i, interval in max_motions_down.items():
                         try:
                             motions = vl[note_i]
@@ -168,11 +164,6 @@ def test_efficient_voice_leading():
                             motions = [motions]
                         for motion in motions:
                             assert motion >= interval
-                    # for note_i, interval in max_motions_down.items():
-                    #     try:
-                    #         assert vl[note_i] >= interval
-                    #     except IndexError:
-                    #         pass
                 assert displacement1 > displacement
                 displacement = displacement1
 
@@ -196,7 +187,3 @@ def test_different_cardinality_handler(chord1, chord2, forward):
         for vl in vls:
             c4 = [p % 12 for p in apply_vl(vl, c1)[0]]
             assert set(p % 12 for p in c4) == set(c3)
-
-
-if __name__ == "__main__":
-    test_efficient_voice_leading()
