@@ -48,7 +48,6 @@ EquivalentVoiceLeadingMotions = t.Tuple[t.List[VoiceLeadingMotion], int]
 VoiceAssignments = t.Tuple[int, ...]
 
 
-# TODO: (Malcolm 2023-07-19) double-check temperature
 def softmax(x, temperature=1.0):
     """
     >>> weights = [1 / 2, 2 / 3]
@@ -260,6 +259,14 @@ def get_preserve_bass_vl_atom(
     atoms.sort(key=abs)
 
     yield from atoms
+
+
+def get_root_only_vl_motion(
+    bass_vl_atom: BijectiveVoiceLeadingAtom, n_atoms: int
+) -> VoiceLeadingMotion:
+    assert n_atoms > 0
+    motion = (bass_vl_atom,) + (None,) * (n_atoms - 1)
+    return motion
 
 
 def pop_voice_leading_from_options(
@@ -1371,6 +1378,12 @@ def preserve_bass_vl_iters(
     >>> [next(vl_iter) for vl_iter in vl_iters]
     [([(2, 1, (0, 4))], 7), ([(-10, 1, (0, 4))], 15)]
 
+    If dst_pcs contains only 1 item, we assume it is the bass:
+    >>> src_pitches = [60, 64, 67]
+    >>> dst_pcs = [2]
+    >>> vl_iters = preserve_bass_vl_iters(src_pitches, dst_pcs)
+    >>> [next(vl_iter) for vl_iter in vl_iters]
+    [([(2, None, None)], 2), ([(-10, None, None)], 10)]
     """
     if max_bass_pitch is None:
         max_bass_pitch = max_pitch
@@ -1387,6 +1400,12 @@ def preserve_bass_vl_iters(
     exclude_motions = _remap_from_omitted_indices(exclude_motions, omitted_indices=[0])
 
     for root_motion in root_motions:
+        if len(dst_pcs) == 1:
+            vl_motion = get_root_only_vl_motion(root_motion, len(src_pitches))
+            vl_iters.append(
+                iter([([vl_motion], get_vl_atom_displacement(root_motion))])
+            )
+            continue
         if avoid_bass_crossing:
             dst_bass = src_pitches[0] + root_motion
             this_min_pitch = dst_bass if min_pitch is None else max(min_pitch, dst_bass)
@@ -1532,6 +1551,7 @@ def voice_lead_pitches_multiple_options_iter(
     >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
     ((59, 65, 67), (59, 62, 65, 67), (62, 65, 67))
     """
+
     vl_iters = []
     vl_iters_option_weights = []
 
