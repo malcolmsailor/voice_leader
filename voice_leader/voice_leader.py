@@ -1499,7 +1499,8 @@ def get_voice_lead_pitches_iters(
             "`preserve_bass=True` and `avoid_bass_crossing=False`: bass is not "
             "guaranteed to be preserved"
         )
-
+    if not chord2_pcs and not preserve_bass:
+        return []
     if preserve_bass and len(chord1_pitches) < len(chord2_pcs):
         # If chord1 has fewer pitches than chord2 has pcs, then at least
         # one pitch from chord1 will be "split" into multiple pitches in
@@ -1551,6 +1552,10 @@ def voice_lead_pitches_multiple_options_iter(
     >>> next(vl_iter)[0], next(vl_iter)[0], next(vl_iter)[0]
     ((59, 65, 67), (59, 62, 65, 67), (62, 65, 67))
     """
+
+    # if not any(chord2_pcs_options):
+    #     yield (), ()
+    #     return
 
     vl_iters = []
     vl_iters_option_weights = []
